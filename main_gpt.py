@@ -1,8 +1,6 @@
 '''
-
-v0.52 - Added the modify team option - OK
-
-v0.53 - Loading Pokemon Data from Gsheets -OK
+v0.54 - Added proper logging -OK
+v0.54.1 -Re-aranged pieces of code (func w/ func, scommands w/ scommands, etc.)
 '''
 
 import discord
@@ -32,7 +30,6 @@ from googleapiclient.discovery import build
 
 print("Current Working Directory:", os.getcwd())
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,  # Set the logging level to INFO
@@ -51,6 +48,36 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # Enable server members intent
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+'''GLOBAL VARIABLES'''
+# Set the maximum number of timer extensions allowed per participant
+extensions_limit = 3  # You can adjust this value
+
+# Set the guild ID for the slash commands
+GUILD_ID = discord.Object(id=1326634506605691080)  # Replace with your guild ID
+
+# Define the stall group (replace with actual Pokémon names)
+stall_group = ["blissey", "toxapex", "skarmory", "chansey","clefable","clodsire","corviknight","cresselia","dondozo","garganacl","gliscor","mandibuzz","quagsire","slowking-galar"]
+
+# Set variable for number of Pokémon per Draft
+draft_size = 4
+total_points = 400
+
+# Define the number of coaches allowed in the draft
+coaches_size = 4  # Default value
+
+# Timer duration (in seconds)
+TIMER_DURATION = 60  # Default timer duration (1 minute)
+timer_task = None  # Global variable to store the timer task
+
+# Dictionary to store timers for each participant
+participant_timers = {}
+
+# Global variable to track remaining time for each participant
+remaining_times = {}
+
+# Global variable to store the selected coaches
+selected_coaches = []
 
 '''v0.50'''
 #Function to Authenticate with Google Sheets
@@ -199,8 +226,6 @@ except Exception as e:
 
 pokemon_names = list(pokemon_data.keys())
 
-# Set the maximum number of timer extensions allowed per participant
-extensions_limit = 3  # You can adjust this value
 
 #Function to Update Google Sheets
 def update_google_sheet(is_intentional_clear=False):
@@ -350,49 +375,6 @@ def has_draft_staff_role():
         return True
     return app_commands.check(predicate)
 
-# Set the guild ID for the slash commands
-GUILD_ID = discord.Object(id=1326634506605691080)  # Replace with your guild ID
-
-# Define the stall group (replace with actual Pokémon names)
-stall_group = ["blissey", "toxapex", "skarmory", "chansey","clefable","clodsire","corviknight","cresselia","dondozo","garganacl","gliscor","mandibuzz","quagsire","slowking-galar"]
-
-# Set variable for number of Pokémon per Draft
-draft_size = 4
-total_points = 400
-
-# Define the number of coaches allowed in the draft
-coaches_size = 4  # Default value
-
-# Timer duration (in seconds)
-TIMER_DURATION = 60  # Default timer duration (1 minute)
-timer_task = None  # Global variable to store the timer task
-
-# Dictionary to store timers for each participant
-participant_timers = {}
-
-# Global variable to track remaining time for each participant
-remaining_times = {}
-
-# Global variable to store the selected coaches
-selected_coaches = []
-
-# Function to generate autocomplete choices for coaches
-async def coach_autocomplete(interaction: discord.Interaction, current: str):
-    # Fetch members with the "Draft" role
-    draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
-    if not draft_role:
-        return []
-
-    # Filter members with the "Draft" role and match the current input
-    members = [member for member in interaction.guild.members if draft_role in member.roles]
-    choices = [
-        app_commands.Choice(name=member.display_name, value=str(member.id))
-        for member in members
-        if current.lower() in member.display_name.lower()
-    ][:25]  # Limit to 25 choices
-
-    return choices
-
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
@@ -415,6 +397,195 @@ async def on_ready():
     else:
         logger.info(f"Guild with ID {GUILD_ID.id} not found.")
 
+'''Empieza V0.44'''
+
+'''HELPER FUNCTIONS'''
+## Split Validations into Helper Functions##
+async def validate_draft_state(interaction: discord.Interaction, user) -> bool:
+    """Check if draft exists and user can pick"""
+    # Check if a draft exists and user can pick
+    if not draft_state["participants"]:
+        await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
+        return False
+        
+    if draft_state["is_paused"]:
+        await interaction.response.send_message("The draft is currently paused. You cannot pick a Pokémon until it is resumed.", ephemeral=True)
+        return False
+
+    if user not in draft_state["participants"]:
+        await interaction.response.send_message("You are not part of the draft.", ephemeral=True)
+        return False
+    return True
+
+async def validate_turn(interaction: discord.Interaction, user) -> bool:
+    """Check if it's user's turn and they can still pick"""
+    # Check if it's user's turn
+    current_pick_index = draft_state["current_pick"] % len(draft_state["order"])
+    if draft_state["order"][current_pick_index] != user:
+        await interaction.response.send_message("It's not your turn to pick.", ephemeral=True)
+        return False
+
+    # Check if user's draft is full
+    if len(draft_state["teams"][user]["pokemon"]) >= draft_size:
+        await interaction.response.send_message(f"Your team already has {draft_size} Pokémon. You can't pick more!", ephemeral=True)
+        return False
+    return True
+
+##Create a Points Calculator Helper
+def calculate_minimum_points(available_pokemon: list, remaining_picks: int) -> int:
+    """Calculate minimum points needed for remaining picks"""
+    min_points_required = 0
+    available_sorted = sorted(available_pokemon, key=lambda x: pokemon_data[x]["points"])
+    for i in range(remaining_picks):
+        if i < len(available_sorted):
+            min_points_required += pokemon_data[available_sorted[i]]["points"]
+        else:
+            # If there aren't enough Pokémon left, assume the next tier (e.g., 40 points)
+            min_points_required += 40  # Adjust this value based on your tier system
+    return min_points_required
+
+##Separate Embed Creation
+def create_pick_announcement_embed(user: discord.Member, pokemon_name: str, pokemon_info: dict) -> discord.Embed:
+    """Create and return embed for pick announcement"""
+    # Create and send embed
+    embed = discord.Embed(
+        title=f"¡{pokemon_name.capitalize()} YO TE ELIJO!",
+        description=f"{user.mention} ha elegido a {pokemon_name.capitalize()}\n\n**Tier:** {pokemon_info['tier']}",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{pokemon_info['id']}.png")
+    return embed
+
+#Helper Function to display final teams (updated in v0.50)
+async def show_final_teams(interaction: discord.Interaction):
+    """Display the final teams for all participants"""
+    await interaction.followup.send("All participants have completed their picks! Now here are the draft of each team:")
+
+    # Show final teams
+    for member, team in draft_state["teams"].items():
+        # Get the user's avatar URL
+        avatar_url = str(member.avatar.url)  # Get the URL of the user's avatar
+        
+        # Create a sprite collage with the user's avatar
+        collage_path = create_sprite_collage(team["pokemon"], pokemon_data, avatar_url)
+        
+        file = discord.File(collage_path, filename="collage.png")
+        embed = discord.Embed(title=f"{member.display_name}'s Team", color=discord.Color.blue())
+        embed.set_image(url="attachment://collage.png")
+        
+        # Send the embed with the file
+        await interaction.followup.send(file=file, embed=embed)
+   
+    # Update the Google Sheet with final results
+    update_google_sheet()
+
+# Function to generate autocomplete choices for coaches
+async def coach_autocomplete(interaction: discord.Interaction, current: str):
+    # Fetch members with the "Draft" role
+    draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
+    if not draft_role:
+        return []
+
+    # Filter members with the "Draft" role and match the current input
+    members = [member for member in interaction.guild.members if draft_role in member.roles]
+    choices = [
+        app_commands.Choice(name=member.display_name, value=str(member.id))
+        for member in members
+        if current.lower() in member.display_name.lower()
+    ][:25]  # Limit to 25 choices
+
+    return choices
+
+'''Empieza V0.45'''
+#Pokemon name validation - This function handles name checking and suggestions:
+async def validate_pokemon_name(interaction: discord.Interaction, pokemon_name: str, user) -> tuple[bool, dict]:
+    """Validate pokemon name and return (is_valid, pokemon_info)"""
+    pokemon_name = pokemon_name.lower()
+    
+    if pokemon_name not in draft_state["available_pokemon"]:
+        similar_names = difflib.get_close_matches(pokemon_name, draft_state["available_pokemon"], n=5, cutoff=0.6)
+        message = (
+            f"Invalid Pokémon name. Did you mean one of these?\n" +
+            "\n".join(similar_names) if similar_names else "Sorry, no similar names found."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        await extend_timer(interaction, user, 60)
+        return False, None
+    
+    return True, pokemon_data[pokemon_name]
+
+#Rules Validation - Combines stall group and species clause checks:
+async def validate_pokemon_rules(interaction: discord.Interaction, pokemon_name: str, pokemon_info: dict, user) -> bool:
+    """Validate stall group and species clause rules"""
+    # Check stall group limit
+    if pokemon_name in stall_group and has_reached_stall_limit(user):
+        await interaction.response.send_message(
+            f"You already have 2 Pokémon from the stall group in your team. "
+            f"You cannot pick another Pokémon from this group.",
+            ephemeral=True
+        )
+        await extend_timer(interaction, user, 60)
+        return False
+
+    # Check Species Clause
+    if any(pokemon_data[p]["dex_number"] == pokemon_info["dex_number"] for p in draft_state["teams"][user]["pokemon"]):
+        await interaction.response.send_message(
+            f"You already have a Pokémon with the same Pokédex number in your team. "
+            f"You cannot pick {pokemon_name.capitalize()} due to the Species Clause.",
+            ephemeral=True
+        )
+        await extend_timer(interaction, user, 60)
+        return False
+    
+    return True
+
+#Points Validation - For checking if the pick is valid points-wise:
+async def validate_points(interaction: discord.Interaction, pokemon_name: str, pokemon_info: dict, user) -> bool:
+    """Validate if user has enough points for the pick"""
+    remaining_picks = draft_size - len(draft_state["teams"][user]["pokemon"]) - 1
+    min_points_required = calculate_minimum_points(draft_state["available_pokemon"], remaining_picks)
+    current_points = draft_state["teams"][user]["points"]
+
+    if pokemon_info["points"] > (current_points - min_points_required):
+        valid_points = sorted(set(
+            pokemon_data[name]["points"] 
+            for name in draft_state["available_pokemon"]
+            if pokemon_data[name]["points"] <= current_points - min_points_required
+        ))
+        
+        message = (
+            f"You cannot pick {pokemon_name.capitalize()} because it would leave you with insufficient points "
+            f"to complete your team. You can pick a Pokémon with a maximum of **{valid_points[-1]}** points."
+            "\n\nAvailable Tiers from which you can pick:\n"
+            + "\n".join([f"• {point} points" for point in valid_points])
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        await extend_timer(interaction, user, 60)
+        return False
+    
+    return True
+
+#Process Pick - Handles updating the draft state after a valid pick: (updated in v0.50)
+def process_pick(user: discord.Member, pokemon_name: str, pokemon_info: dict) -> int:
+    draft_state["teams"][user]["pokemon"].append(pokemon_name)
+    draft_state["teams"][user]["points"] -= pokemon_info["points"]
+    draft_state["available_pokemon"].remove(pokemon_name)
+    
+    if user in draft_state["extensions"]:
+        draft_state["extensions"][user] = 0
+        logger.info(f"Reset extension count for {user.name}.")
+
+    if user in remaining_times:
+        logger.info(f"Clearing remaining time for {user.name}. Previous remaining time: {remaining_times[user]} seconds.")
+        del remaining_times[user]
+    else:
+        logger.info(f"No remaining time to clear for {user.name}.")
+    
+    # Update the Google Sheet
+    update_google_sheet()
+    
+    return draft_state["teams"][user]["points"]
+ 
 # Function to start the draft (updated in v0.50)
 async def start_draft(interaction: discord.Interaction, participants: list[discord.Member]):
     global selected_coaches
@@ -477,12 +648,12 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
         if skipped_turns == 1:
             adjusted_duration = TIMER_DURATION // 2  # Half the initial time
             await interaction.followup.send(
-                f"⚠️ {participant.mention}, you were skipped once. Your timer is now **{format_time(adjusted_duration)}**."
+                f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(adjusted_duration)}**."
             )
         elif skipped_turns >= 2:
             adjusted_duration = TIMER_DURATION // 4  # Quarter of the initial time
             await interaction.followup.send(
-                f"⚠️ {participant.mention}, you were skipped multiple times. Your timer is now **{format_time(adjusted_duration)}**."
+                f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(adjusted_duration)}**."
             )
         else:
             adjusted_duration = TIMER_DURATION  # Initial time
@@ -601,13 +772,14 @@ async def notify_current_participant(interaction: discord.Interaction):
     # Notify the current participant
     await interaction.followup.send(
         f"It's {current_user.mention}'s turn to pick!\n"
-        f"You have **{remaining_points} points** and can pick **{remaining_picks} more Pokémon**."
+        f"You have **{remaining_points} points** and must pick **{remaining_picks} more Pokémon**."
     )
 
     # Start the timer for the current participant
     timer_task = asyncio.create_task(start_timer(interaction, current_user))
     participant_timers[current_user] = timer_task #Store timer task
 
+#Function that pivots to next participant
 async def next_participant(interaction: discord.Interaction):
     global draft_state, remaining_times
 
@@ -646,6 +818,152 @@ def has_reached_stall_limit(user):
     stall_count = sum(1 for pokemon in draft_state["teams"][user]["pokemon"] if pokemon in stall_group)
     return stall_count >= 2
 
+'''v0.52 VIEWS'''
+#Class for ConfirmationView
+class ConfirmationView(discord.ui.View):
+    """
+    A generic confirmation view with Yes/No buttons.
+    Buttons are disabled immediately upon clicking.
+    """
+    def __init__(self, timeout=30):
+        super().__init__(timeout=timeout)
+        self.value = None
+        self.clicked = False  # Track if a button has been clicked
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        """Disable all buttons and update the message"""
+        for item in self.children:
+            item.disabled = True
+        # Update message with disabled buttons immediately
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the confirmation
+        self.value = True
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the cancellation
+        self.value = False
+        self.stop()
+
+    async def on_timeout(self):
+        self.value = None
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+
+'''v0.46'''
+##Confirmation View Class
+class PickConfirmationView(discord.ui.View):
+    def __init__(self, remaining_time: int, timeout=30):
+        super().__init__(timeout=timeout)
+        self.value = None
+        self.remaining_time = remaining_time  # Store the remaining time when view is created
+        self.clicked = False  # Track if a button has been clicked
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        """Disable all buttons and update the message"""
+        for item in self.children:
+            item.disabled = True
+        # Update message with disabled buttons immediately
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the confirmation
+        self.value = True
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the cancellation
+        self.value = False
+        self.stop()
+
+    async def on_timeout(self):
+        self.value = None
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+
+'''v0.51'''
+#Class for skip confirmation
+class SkipConfirmationView(discord.ui.View):
+    def __init__(self, timeout=30):
+        super().__init__(timeout=timeout)
+        self.value = None
+        self.clicked = False  # Track if a button has been clicked
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        """Disable all buttons and update the message"""
+        for item in self.children:
+            item.disabled = True
+        # Update message with disabled buttons immediately
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Confirm Skip", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the confirmation
+        self.value = True
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:  # Prevent multiple clicks
+            return
+        self.clicked = True
+        
+        # Disable buttons immediately
+        await self.disable_all_buttons(interaction)
+        
+        # Then process the cancellation
+        self.value = False
+        self.stop()
+
+    async def on_timeout(self):
+        self.value = None
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+
 '''V0.47'''
 #slash command to set the number of coaches
 @bot.tree.command(name="numberofcoaches", description="Change the number of coaches allowed in the draft", guild=GUILD_ID)
@@ -653,6 +971,7 @@ def has_reached_stall_limit(user):
 @has_draft_staff_role()
 async def number_of_coaches_command(interaction: discord.Interaction, new_size: int):
     global coaches_size
+    logger.info(f"{interaction.user.name} attempting to set number of coaches to {new_size}")
 
     # Defer the response immediately to prevent timeout
     await interaction.response.defer(ephemeral=True)
@@ -666,11 +985,13 @@ async def number_of_coaches_command(interaction: discord.Interaction, new_size: 
 
     # Check if a draft is in progress or paused
     if draft_state["participants"] or draft_state["is_paused"]:
+        logger.error(f"{interaction.user.name} failed to set coaches - Draft active or paused")
         await status_message.edit(content="❌ Cannot change the number of coaches while a draft is in progress or paused.")
         return
 
     # Validate the new size (minimum 2)
     if new_size < 2:
+        logger.error(f"{interaction.user.name} failed to set coaches - Invalid size {new_size}")
         await status_message.edit(content="❌ The number of coaches must be at least **2**.")
         return
 
@@ -689,6 +1010,7 @@ async def number_of_coaches_command(interaction: discord.Interaction, new_size: 
         # Remove the existing set_coaches command
         try:
             bot.tree.remove_command("set_coaches", guild=GUILD_ID)
+            logger.info(f"{interaction.user.name} removed old set_coaches command")
         except Exception:
             pass  # Command might not exist yet
 
@@ -803,6 +1125,7 @@ async def set_coaches_command({func_params}):
 
         # Create and add the new command
         new_command = create_dynamic_set_coaches()
+        logger.info(f"{interaction.user.name} created new set_coaches command for {new_size} coaches")
 
         # Update status - Step 2 complete
         await status_message.edit(content=(
@@ -813,6 +1136,7 @@ async def set_coaches_command({func_params}):
         
         # Sync the commands
         await bot.tree.sync(guild=GUILD_ID)
+        logger.info(f"{interaction.user.name} synced commands successfully")
 
         # Final success message
         await status_message.edit(content=(
@@ -822,9 +1146,10 @@ async def set_coaches_command({func_params}):
             f"• Current: {coaches_size}\n\n"
             f"The `/set_coaches` command has been updated to accept **{coaches_size}** coaches."
         ))
+        logger.info(f"{interaction.user.name} successfully updated number of coaches from {old_size} to {new_size}")
 
     except Exception as e:
-        logger.error(f"Error updating commands: {e}")
+        logger.error(f"{interaction.user.name} failed to update commands: {str(e)}")
         await status_message.edit(content=(
             "❌ An error occurred while updating the commands:\n"
             f"```\n{str(e)}\n```\n"
@@ -835,25 +1160,30 @@ async def set_coaches_command({func_params}):
 @bot.tree.command(name="start_draft", description="Start the Pokémon draft", guild=GUILD_ID)
 async def start_draft_command(interaction: discord.Interaction):
     global selected_coaches
+    logger.info(f"{interaction.user.name} attempting to start draft")
 
     # Defer the response immediately to prevent interaction timeout
     await interaction.response.defer()
 
     # Check if coaches have been set
     if not selected_coaches:
+        logger.error(f"{interaction.user.name} failed to start draft - No coaches selected")
         await interaction.followup.send("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
         return
 
     # Check if a draft is already in progress
     if draft_state["participants"]:
-        await interaction.followup.send("A draft is already in progress. Please wait until the current draft finishes before starting a new one.")
+        logger.error(f"{interaction.user.name} failed to start draft - Draft already in progress")
+        await interaction.followup.send("A draft is already in progress. Please wait until the current draft finishes before starting a new one.", ephemeral=True)
         return
 
     try:
         # Start the draft with the selected coaches
         await start_draft(interaction, selected_coaches)
+        coach_names = [coach.name for coach in selected_coaches]
+        logger.info(f"{interaction.user.name} successfully started draft with coaches: {', '.join(coach_names)}")
     except Exception as e:
-        logger.error(f"Error starting draft: {e}")
+        logger.error(f"{interaction.user.name} failed to start draft - Error: {str(e)}")
         await interaction.followup.send(
             "An error occurred while starting the draft. Please try again or contact the administrator.",
             ephemeral=True
@@ -868,8 +1198,8 @@ async def start_draft_command(interaction: discord.Interaction):
 )
 @has_draft_staff_role()
 async def stop_draft_command(interaction: discord.Interaction):
-    # Defer the response to prevent timeout
-    await interaction.response.defer(ephemeral=True)
+    logger.info(f"{interaction.user.name} attempting emergency draft stop")
+    await interaction.response.defer(ephemeral=True) # Defer the response to prevent timeout
     
     # Send warning message with confirmation buttons
     view = ConfirmationView(timeout=60)  # Using our improved ConfirmationView
@@ -897,9 +1227,9 @@ async def stop_draft_command(interaction: discord.Interaction):
             for participant, timer in participant_timers.copy().items():
                 try:
                     await cancel_timer(participant)
-                    logger.info(f"Cancelled timer for {participant.name}")
+                    logger.info(f"{interaction.user.name} cancelled timer for {participant.name}")
                 except Exception as e:
-                    logger.error(f"Error cancelling timer for {participant.name}: {e}")
+                    logger.error(f"{interaction.user.name} failed to cancel timer for {participant.name}: {str(e)}")
             
             # Clear timer-related dictionaries
             participant_timers.clear()
@@ -923,21 +1253,24 @@ async def stop_draft_command(interaction: discord.Interaction):
             # Update Google Sheets (with error handling)
             try:
                 update_google_sheet(is_intentional_clear=True)
+                logger.info(f"{interaction.user.name} updated Google Sheet after stopping draft")
             except Exception as e:
-                    logger.error(f"Error updating Google Sheet: {e}")
-                    await interaction.followup.send(
-                        "⚠️ The draft was stopped, but there was an error updating the Google Sheet. "
-                        "Please check the logs for details.",
-                        ephemeral=True
-                    )
+                logger.error(f"{interaction.user.name} failed to update Google Sheet after stop: {str(e)}")
+                await interaction.followup.send(
+                    "⚠️ The draft was stopped, but there was an error updating the Google Sheet. "
+                    "Please check the logs for details.",
+                    ephemeral=True
+                )
 
             # Send success message
             await interaction.followup.send(
                 "✅ Draft has been completely stopped and reset.\n\n"
                 "• All timers have been cancelled\n"
                 "• All draft data has been cleared\n"
-                "• The bot is ready for a new draft"
+                "• The bot is ready for a new draft",
+                ephemeral= True
             )
+            logger.info(f"{interaction.user.name} successfully stopped and reset draft")
                 
             # Optional: Send a message to the channel that the draft was stopped
             try:
@@ -958,283 +1291,18 @@ async def stop_draft_command(interaction: discord.Interaction):
                 ephemeral=True
             )
     else:  # Cancelled or timed out
+        logger.info(f"{interaction.user.name} cancelled draft stop attempt")
         await interaction.followup.send(
             "✅ Stop draft cancelled. The draft will continue normally.",
             ephemeral=True
         )
 
-'''Empieza V0.44'''
-
-'''HELPER FUNCTIONS'''
-## Split Validations into Helper Functions##
-async def validate_draft_state(interaction: discord.Interaction, user) -> bool:
-    """Check if draft exists and user can pick"""
-    # Check if a draft exists and user can pick
-    if not draft_state["participants"]:
-        await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
-        return False
-        
-    if draft_state["is_paused"]:
-        await interaction.response.send_message("The draft is currently paused. You cannot pick a Pokémon until it is resumed.", ephemeral=True)
-        return False
-
-    if user not in draft_state["participants"]:
-        await interaction.response.send_message("You are not part of the draft.", ephemeral=True)
-        return False
-    return True
-
-async def validate_turn(interaction: discord.Interaction, user) -> bool:
-    """Check if it's user's turn and they can still pick"""
-    # Check if it's user's turn
-    current_pick_index = draft_state["current_pick"] % len(draft_state["order"])
-    if draft_state["order"][current_pick_index] != user:
-        await interaction.response.send_message("It's not your turn to pick.", ephemeral=True)
-        return False
-
-    # Check if user's draft is full
-    if len(draft_state["teams"][user]["pokemon"]) >= draft_size:
-        await interaction.response.send_message(f"Your team already has {draft_size} Pokémon. You can't pick more!", ephemeral=True)
-        return False
-    return True
-
-##Create a Points Calculator Helper
-def calculate_minimum_points(available_pokemon: list, remaining_picks: int) -> int:
-    """Calculate minimum points needed for remaining picks"""
-    min_points_required = 0
-    available_sorted = sorted(available_pokemon, key=lambda x: pokemon_data[x]["points"])
-    for i in range(remaining_picks):
-        if i < len(available_sorted):
-            min_points_required += pokemon_data[available_sorted[i]]["points"]
-        else:
-            # If there aren't enough Pokémon left, assume the next tier (e.g., 40 points)
-            min_points_required += 40  # Adjust this value based on your tier system
-    return min_points_required
-
-##Separate Embed Creation
-def create_pick_announcement_embed(user: discord.Member, pokemon_name: str, pokemon_info: dict) -> discord.Embed:
-    """Create and return embed for pick announcement"""
-    # Create and send embed
-    embed = discord.Embed(
-        title=f"¡{pokemon_name.capitalize()} YO TE ELIJO!",
-        description=f"{user.mention} ha elegido a {pokemon_name.capitalize()}\n\n**Tier:** {pokemon_info['tier']}",
-        color=discord.Color.green()
-    )
-    embed.set_thumbnail(url=f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{pokemon_info['id']}.png")
-    return embed
-
-#Helper Function to display final teams (updated in v0.50)
-async def show_final_teams(interaction: discord.Interaction):
-    """Display the final teams for all participants"""
-    await interaction.followup.send("All participants have completed their picks! Now here are the draft of each team:")
-
-    # Show final teams
-    for member, team in draft_state["teams"].items():
-        # Get the user's avatar URL
-        avatar_url = str(member.avatar.url)  # Get the URL of the user's avatar
-        
-        # Create a sprite collage with the user's avatar
-        collage_path = create_sprite_collage(team["pokemon"], pokemon_data, avatar_url)
-        
-        file = discord.File(collage_path, filename="collage.png")
-        embed = discord.Embed(title=f"{member.display_name}'s Team", color=discord.Color.blue())
-        embed.set_image(url="attachment://collage.png")
-        
-        # Send the embed with the file
-        await interaction.followup.send(file=file, embed=embed)
-   
-    # Update the Google Sheet with final results
-    update_google_sheet()
-
-'''Empieza V0.45'''
-#Pokemon name validation - This function handles name checking and suggestions:
-async def validate_pokemon_name(interaction: discord.Interaction, pokemon_name: str, user) -> tuple[bool, dict]:
-    """Validate pokemon name and return (is_valid, pokemon_info)"""
-    pokemon_name = pokemon_name.lower()
-    
-    if pokemon_name not in draft_state["available_pokemon"]:
-        similar_names = difflib.get_close_matches(pokemon_name, draft_state["available_pokemon"], n=5, cutoff=0.6)
-        message = (
-            f"Invalid Pokémon name. Did you mean one of these?\n" +
-            "\n".join(similar_names) if similar_names else "Sorry, no similar names found."
-        )
-        await interaction.response.send_message(message, ephemeral=True)
-        await extend_timer(interaction, user, 60)
-        return False, None
-    
-    return True, pokemon_data[pokemon_name]
-
-#Rules Validation - Combines stall group and species clause checks:
-async def validate_pokemon_rules(interaction: discord.Interaction, pokemon_name: str, pokemon_info: dict, user) -> bool:
-    """Validate stall group and species clause rules"""
-    # Check stall group limit
-    if pokemon_name in stall_group and has_reached_stall_limit(user):
-        await interaction.response.send_message(
-            f"You already have 2 Pokémon from the stall group in your team. "
-            f"You cannot pick another Pokémon from this group.",
-            ephemeral=True
-        )
-        await extend_timer(interaction, user, 60)
-        return False
-
-    # Check Species Clause
-    if any(pokemon_data[p]["dex_number"] == pokemon_info["dex_number"] for p in draft_state["teams"][user]["pokemon"]):
-        await interaction.response.send_message(
-            f"You already have a Pokémon with the same Pokédex number in your team. "
-            f"You cannot pick {pokemon_name.capitalize()} due to the Species Clause.",
-            ephemeral=True
-        )
-        await extend_timer(interaction, user, 60)
-        return False
-    
-    return True
-
-#Points Validation - For checking if the pick is valid points-wise:
-async def validate_points(interaction: discord.Interaction, pokemon_name: str, pokemon_info: dict, user) -> bool:
-    """Validate if user has enough points for the pick"""
-    remaining_picks = draft_size - len(draft_state["teams"][user]["pokemon"]) - 1
-    min_points_required = calculate_minimum_points(draft_state["available_pokemon"], remaining_picks)
-    current_points = draft_state["teams"][user]["points"]
-
-    if pokemon_info["points"] > (current_points - min_points_required):
-        valid_points = sorted(set(
-            pokemon_data[name]["points"] 
-            for name in draft_state["available_pokemon"]
-            if pokemon_data[name]["points"] <= current_points - min_points_required
-        ))
-        
-        message = (
-            f"You cannot pick {pokemon_name.capitalize()} because it would leave you with insufficient points "
-            f"to complete your team. You can pick a Pokémon with a maximum of **{valid_points[-1]}** points."
-            "\n\nAvailable Tiers from which you can pick:\n"
-            + "\n".join([f"• {point} points" for point in valid_points])
-        )
-        await interaction.response.send_message(message, ephemeral=True)
-        await extend_timer(interaction, user, 60)
-        return False
-    
-    return True
-
-#Process Pick - Handles updating the draft state after a valid pick: (updated in v0.50)
-def process_pick(user: discord.Member, pokemon_name: str, pokemon_info: dict) -> int:
-    draft_state["teams"][user]["pokemon"].append(pokemon_name)
-    draft_state["teams"][user]["points"] -= pokemon_info["points"]
-    draft_state["available_pokemon"].remove(pokemon_name)
-    
-    if user in draft_state["extensions"]:
-        draft_state["extensions"][user] = 0
-        logger.info(f"Reset extension count for {user.name}.")
-
-    if user in remaining_times:
-        logger.info(f"Clearing remaining time for {user.name}. Previous remaining time: {remaining_times[user]} seconds.")
-        del remaining_times[user]
-    else:
-        logger.info(f"No remaining time to clear for {user.name}.")
-    
-    # Update the Google Sheet
-    update_google_sheet()
-    
-    return draft_state["teams"][user]["points"]
- 
-'''v0.46'''
-##Confirmation View Class
-class PickConfirmationView(discord.ui.View):
-    def __init__(self, remaining_time: int, timeout=30):
-        super().__init__(timeout=timeout)
-        self.value = None
-        self.remaining_time = remaining_time  # Store the remaining time when view is created
-        self.clicked = False  # Track if a button has been clicked
-
-    async def disable_all_buttons(self, interaction: discord.Interaction):
-        """Disable all buttons and update the message"""
-        for item in self.children:
-            item.disabled = True
-        # Update message with disabled buttons immediately
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the confirmation
-        self.value = True
-        self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the cancellation
-        self.value = False
-        self.stop()
-
-    async def on_timeout(self):
-        self.value = None
-        # Disable all buttons
-        for item in self.children:
-            item.disabled = True
-
-'''v0.51'''
-#Class for skip confirmation
-class SkipConfirmationView(discord.ui.View):
-    def __init__(self, timeout=30):
-        super().__init__(timeout=timeout)
-        self.value = None
-        self.clicked = False  # Track if a button has been clicked
-
-    async def disable_all_buttons(self, interaction: discord.Interaction):
-        """Disable all buttons and update the message"""
-        for item in self.children:
-            item.disabled = True
-        # Update message with disabled buttons immediately
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="Confirm Skip", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the confirmation
-        self.value = True
-        self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the cancellation
-        self.value = False
-        self.stop()
-
-    async def on_timeout(self):
-        self.value = None
-        # Disable all buttons
-        for item in self.children:
-            item.disabled = True
 
 #Slash command to skip coach turnn
 @bot.tree.command(name="skip", description="Skip the current player's turn (Draft Staff only)", guild=GUILD_ID)
 @has_draft_staff_role()
 async def skip_command(interaction: discord.Interaction):
-    # Defer immediately since we'll do multiple operations
+    logger.info(f"User {interaction.user.name} attempting to skip turn")
     await interaction.response.defer()
 
     # Get the current participant that will be skipped
@@ -1242,10 +1310,12 @@ async def skip_command(interaction: discord.Interaction):
 
     # Validate draft state first
     if not draft_state["participants"]:
+        logger.error(f"User {interaction.user.name} failed skip - No draft in progress")
         await interaction.followup.send("No draft is currently in progress.", ephemeral=True)
         return
 
     if draft_state["is_paused"]:
+        logger.error(f"User {interaction.user.name} failed skip - Draft is paused")
         await interaction.followup.send("The draft is currently paused. Cannot skip turns while paused.", ephemeral=True)
         return
 
@@ -1273,20 +1343,24 @@ async def skip_command(interaction: discord.Interaction):
     await view.wait()
 
     if view.value is None:
+        logger.info(f"User {interaction.user.name} skip confirmation timed out")
         await interaction.followup.send("Skip confirmation timed out.", ephemeral=True)
         return
     
     if not view.value:
+        logger.info(f"User {interaction.user.name} cancelled skip")
         await interaction.followup.send("Skip cancelled.", ephemeral=True)
         return
 
     # Proceed with the skip
     # Cancel the current timer
     await cancel_timer(current_user)
+    logger.info(f"Timer cancelled for {current_user.name}")
 
     # Clear any remaining time for the user
     if current_user in remaining_times:
         del remaining_times[current_user]
+        logger.info(f"Cleared remaining time for {current_user.name}")
 
     # Increment skip counter
     if current_user not in draft_state["skipped_turns"]:
@@ -1310,8 +1384,9 @@ async def skip_command(interaction: discord.Interaction):
     # Update Google Sheet to reflect the skip
     try:
         update_google_sheet()
+        logger.info(f"Successfully updated Google Sheet after skip")
     except Exception as e:
-        logger.error(f"Error updating Google Sheet after skip: {e}")
+        logger.error(f"Failed to update Google Sheet after skip: {str(e)}")
         await interaction.followup.send(
             "⚠️ The skip was processed, but there was an error updating the Google Sheet.",
             ephemeral=True
@@ -1327,24 +1402,30 @@ async def skip_command(interaction: discord.Interaction):
 async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
     global participant_timers, remaining_times
     user = interaction.user
-    
+    logger.info(f"{user.name} attempting to pick pokemon: {pokemon_name}")
     # --- 1. Initial validations ---
     if not await validate_draft_state(interaction, user):
+        logger.error(f"{user.name} failed pick - Invalid draft state")
         return
+
     if not await validate_turn(interaction, user):
+        logger.error(f"{user.name} failed pick - Not their turn")
         return
 
     # --- 2. Pokemon validation ---
     is_valid, pokemon_info = await validate_pokemon_name(interaction, pokemon_name, user)
     if not is_valid:
+        logger.error(f"{user.name} failed pick - Invalid Pokemon name: {pokemon_name}")
         return
 
     # --- 3. Rules validation ---
     if not await validate_pokemon_rules(interaction, pokemon_name, pokemon_info, user):
+        logger.error(f"{user.name} failed pick - Rules violation for {pokemon_name}")
         return
 
     # --- 4. Points validation ---
     if not await validate_points(interaction, pokemon_name, pokemon_info, user):
+        logger.error(f"{user.name} failed pick - Insufficient points for {pokemon_name}")
         return
 
         # Get current timer before canceling it
@@ -1357,11 +1438,12 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
     if current_timer:
         await cancel_timer(user)
         current_remaining_time = remaining_times.get(user)
-        logger.info(f"Captured remaining time for {user.name}: {current_remaining_time} seconds")
+        logger.info(f"{user.name} timer cancelled with {current_remaining_time} seconds remaining")
 
     # Send public message if remaining time is less than a minute
     if current_remaining_time and current_remaining_time < 60:
-        await interaction.channel.send(f" {user.display_name} is confirming their Pokémon pick, timer will resume in 30 seconds")
+        logger.info(f"{user.name} confirming pick with less than 60 seconds remaining")
+        await interaction.channel.send(f"{user.display_name} is confirming their Pokémon pick, timer will resume in 30 seconds")
 
     # --- 5. Create confirmation message ---
     confirmation_embed = discord.Embed(
@@ -1420,15 +1502,18 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
         timer_task = asyncio.create_task(start_timer(interaction, user, resume_time))
         participant_timers[user] = timer_task
         
+        action = "timed out" if view.value is None else "cancelled"
+        logger.info(f"{user.name} {action} pick of {pokemon_name}")
         await interaction.followup.send(
-            "Pick confirmation timed out. Please try again.\n" + extension_msg if view.value is None 
-            else "Pick cancelled. You can try picking another Pokémon.\n" + extension_msg, 
+            f"Pick confirmation {action}. Please try again.\n{extension_msg}" if view.value is None 
+            else f"Pick cancelled. You can try picking another Pokémon.\n{extension_msg}", 
             ephemeral=True
         )
         return
 
     # --- 6. Process confirmed pick ---
     points_left = process_pick(user, pokemon_name, pokemon_info)
+    logger.info(f"{user.name} successfully picked {pokemon_name} - Points remaining: {points_left}")
     
     # Reset auto-extensions counter after successful pick
     if user in draft_state["auto_extensions"]:
@@ -1441,25 +1526,28 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
 
     # --- 8. Handle draft progression ---
     if len(draft_state["teams"][user]["pokemon"]) < draft_size:
+        logger.info(f"{user.name} has {points_left} points remaining")
         await interaction.followup.send(f"{user.mention}, you now have **{points_left} points** remaining.", ephemeral=True)
     else:
         await cancel_timer(user)
         draft_state["order"] = [p for p in draft_state["order"] if p != user]
-        await interaction.followup.send(f"{user.mention}, your draft is complete! You will no longer be part of the rotation.")
+        logger.info(f"{user.name} completed their draft")
+        await interaction.followup.send(f"{user.mention}'s draft is complete! {user.name} will no longer be part of the rotation.")
 
     if all(len(team["pokemon"]) == draft_size for team in draft_state["teams"].values()):
+        logger.info("Draft completed - All teams are full")
         await show_final_teams(interaction)
         draft_state["participants"] = []
         draft_state["order"] = []
         draft_state["current_pick"] = 0
         draft_state["teams"] = {}
         draft_state["available_pokemon"] = pokemon_names.copy()
-        await interaction.followup.send("The draft has finished! The draft state has been reset.")
+        await interaction.followup.send("The draft has finished! The draft state has been reset.", ephemeral=True)
         return
 
     await next_participant(interaction)
 
-# Function to autocomplete for Pokémon names (specific to the guild)
+# Function to autocomplete for Pokémon names (specific to the guild) [Here because is tied to /pick_pokemon]
 @pick_pokemon.autocomplete('pokemon_name')
 async def pokemon_name_autocomplete(interaction: discord.Interaction, current: str):
     # Get a list of Pokémon names and their points
@@ -1486,17 +1574,20 @@ async def pokemon_name_autocomplete(interaction: discord.Interaction, current: s
     
     await interaction.response.autocomplete(choices)
 
-
 # Slash command to clear all messages in the current channel
 @bot.tree.command(name="clear", description="Clear all messages in the current channel", guild=GUILD_ID)
 @has_draft_staff_role()
 async def clear_messages_command(interaction: discord.Interaction):
+    logger.info(f"User {interaction.user.name} attempting to clear messages")
+
     if draft_state["is_paused"]:
+        logger.error(f"User {interaction.user.name} failed clear - Draft is paused")
         await interaction.response.send_message("The draft is currently paused. Messages can't be deleted at this moment.", ephemeral=True)
         return
 
     # Check if the bot has the required permissions
     if not interaction.channel.permissions_for(interaction.guild.me).manage_messages:
+        logger.error(f"User {interaction.user.name} failed clear - Bot lacks permissions")
         await interaction.response.send_message("I don't have permission to manage messages in this channel.", ephemeral=True)
         return
 
@@ -1505,24 +1596,31 @@ async def clear_messages_command(interaction: discord.Interaction):
     try:
         # Use the purge method to bulk delete messages
         deleted = await interaction.channel.purge(limit=None)
-        await interaction.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
+        logger.info(f"User {interaction.user.name} successfully cleared {len(deleted)} messages")
+        await interaction.followup.send(f"Successfully deleted {len(deleted)} messages.", ephemeral=True)
     except Exception as e:
-        logger.error(f"Failed to clear messages: {e}")
-        await interaction.followup.send(f"An error occurred while clearing messages: {e}", ephemeral=True)
+        logger.error(f"User {interaction.user.name} failed to clear messages: {str(e)}")
+        await interaction.followup.send(
+            "An error occurred while clearing messages. Please check my permissions and try again.",
+            ephemeral=True
+        )
 
 #Slash Command to pause the draft
 @bot.tree.command(name="pause_draft", description="Pause the current draft", guild=GUILD_ID)
 @has_draft_staff_role()
 async def pause_draft_command(interaction: discord.Interaction):
     global draft_state
+    logger.info(f"User {interaction.user.name} attempting to pause draft")
 
     # Check if a draft is in progress
     if not draft_state["participants"]:
+        logger.error(f"User {interaction.user.name} failed pause - No draft in progress")
         await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
         return
 
     # Check if the draft is already paused
     if draft_state["is_paused"]:
+        logger.error(f"User {interaction.user.name} failed pause - Draft already paused")
         await interaction.response.send_message("The draft is already paused.", ephemeral=True)
         return
 
@@ -1533,6 +1631,7 @@ async def pause_draft_command(interaction: discord.Interaction):
     # Set the draft to paused state
     draft_state["is_paused"] = True
 
+    logger.info(f"User {interaction.user.name} successfully paused draft - {current_user.name} was in turn")
     await interaction.response.send_message(f"The draft has been paused. {current_user.mention} was in turn.")
 
 #Slash Command to resume the draft
@@ -1540,14 +1639,17 @@ async def pause_draft_command(interaction: discord.Interaction):
 @has_draft_staff_role()
 async def resume_draft_command(interaction: discord.Interaction):
     global draft_state
+    logger.info(f"User {interaction.user.name} attempting to resume draft")
 
     # Check if a draft is in progress
     if not draft_state["participants"]:
+        logger.error(f"User {interaction.user.name} failed resume - No draft in progress")
         await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
         return
 
     # Check if the draft is not paused
     if not draft_state["is_paused"]:
+        logger.error(f"User {interaction.user.name} failed resume - Draft not paused")
         await interaction.response.send_message("The draft is not paused.", ephemeral=True)
         return
 
@@ -1560,6 +1662,7 @@ async def resume_draft_command(interaction: discord.Interaction):
     timer_task = asyncio.create_task(start_timer(interaction, current_user, remaining_time))
     participant_timers[current_user] = timer_task
 
+    logger.info(f"User {interaction.user.name} successfully resumed draft - {current_user.name} has {remaining_time} seconds remaining")
     await interaction.response.send_message(f"The draft has been resumed. {current_user.mention}, you have {format_time(remaining_time)} remaining.")
 
 # Slash command to check current draft
@@ -1567,13 +1670,16 @@ async def resume_draft_command(interaction: discord.Interaction):
 @has_draft_role()
 async def my_draft_command(interaction: discord.Interaction):
     user = interaction.user
+    logger.info(f"User {user.name} checking their draft status")
 
     # Check if a draft is in progress
     if not draft_state["participants"]:
+        logger.error(f"User {user.name} failed my_draft - No draft in progress")
         await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
         return
 
     if user not in draft_state["participants"]:
+        logger.error(f"User {user.name} failed my_draft - Not in draft")
         await interaction.response.send_message("You are not part of the draft.", ephemeral=True)
         return
 
@@ -1589,60 +1695,11 @@ async def my_draft_command(interaction: discord.Interaction):
 
     try:
         await user.send(embed=embed)
+        logger.info(f"User {user.name} draft details sent via DM")
         await interaction.response.send_message("Check your DMs for your draft details!", ephemeral=True)
     except discord.Forbidden:
+        logger.info(f"User {user.name} draft details sent in channel (DMs forbidden)")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-'''v0.52'''
-#Class for ConfirmationView
-class ConfirmationView(discord.ui.View):
-    """
-    A generic confirmation view with Yes/No buttons.
-    Buttons are disabled immediately upon clicking.
-    """
-    def __init__(self, timeout=30):
-        super().__init__(timeout=timeout)
-        self.value = None
-        self.clicked = False  # Track if a button has been clicked
-
-    async def disable_all_buttons(self, interaction: discord.Interaction):
-        """Disable all buttons and update the message"""
-        for item in self.children:
-            item.disabled = True
-        # Update message with disabled buttons immediately
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the confirmation
-        self.value = True
-        self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.clicked:  # Prevent multiple clicks
-            return
-        self.clicked = True
-        
-        # Disable buttons immediately
-        await self.disable_all_buttons(interaction)
-        
-        # Then process the cancellation
-        self.value = False
-        self.stop()
-
-    async def on_timeout(self):
-        self.value = None
-        # Disable all buttons
-        for item in self.children:
-            item.disabled = True
 
 #Slash Command to swap pokémon
 @bot.tree.command(
@@ -1662,12 +1719,15 @@ async def swap_pokemon_command(
     current_pokemon: str,
     new_pokemon: str
 ):
+    logger.info(f"User {interaction.user.name} attempting to swap {current_pokemon} with {new_pokemon} for coach {coach}")
+    
     # Defer response due to potentially longer processing time
     await interaction.response.defer(ephemeral=True)
     
     try:
         # Validate draft state and pause status
         if not draft_state["participants"]:
+            logger.error(f"User {interaction.user.name} failed swap - No draft in progress")
             await interaction.followup.send(
                 "❌ No draft is currently in progress.",
                 ephemeral=True
@@ -1676,6 +1736,7 @@ async def swap_pokemon_command(
 
         # Check if draft is paused
         if not draft_state["is_paused"]:
+            logger.error(f"User {interaction.user.name} failed swap - Draft not paused")
             await interaction.followup.send(
                 "❌ The draft must be paused before making team modifications.\n"
                 "Please use `/pause_draft` first.",
@@ -1688,6 +1749,7 @@ async def swap_pokemon_command(
         coach_member = interaction.guild.get_member(coach_id)
         
         if not coach_member:
+            logger.error(f"User {interaction.user.name} failed swap - Coach not found")
             await interaction.followup.send(
                 "❌ Could not find the specified coach.",
                 ephemeral=True
@@ -1695,6 +1757,7 @@ async def swap_pokemon_command(
             return
 
         if coach_member not in draft_state["teams"]:
+            logger.error(f"User {interaction.user.name} failed swap - Coach not in draft")
             await interaction.followup.send(
                 f"❌ {coach_member.display_name} is not part of the current draft.",
                 ephemeral=True
@@ -1707,6 +1770,7 @@ async def swap_pokemon_command(
 
         # Validate current_pokemon is in coach's team
         if current_pokemon not in draft_state["teams"][coach_member]["pokemon"]:
+            logger.error(f"User {interaction.user.name} failed swap - Pokemon not in team")
             await interaction.followup.send(
                 f"❌ {current_pokemon.capitalize()} is not in {coach_member.display_name}'s team.",
                 ephemeral=True
@@ -1715,6 +1779,7 @@ async def swap_pokemon_command(
 
         # Validate new_pokemon exists in pokemon_data
         if new_pokemon not in pokemon_data:
+            logger.error(f"User {interaction.user.name} failed swap - Invalid Pokemon name: {new_pokemon}")
             similar_names = difflib.get_close_matches(new_pokemon, pokemon_names, n=5, cutoff=0.6)
             message = (
                 f"❌ Invalid Pokémon name: {new_pokemon}. Did you mean one of these?\n" +
@@ -1732,6 +1797,7 @@ async def swap_pokemon_command(
         # Validate new_pokemon is available (not in any team)
         for team_member, team_data in draft_state["teams"].items():
             if new_pokemon in team_data["pokemon"]:
+                logger.error(f"User {interaction.user.name} failed swap - Pokemon already drafted")
                 await interaction.followup.send(
                     f"❌ {new_pokemon.capitalize()} is already in {team_member.display_name}'s team.\n"
                     "You can only swap with Pokémon that haven't been picked yet.",
@@ -1741,6 +1807,7 @@ async def swap_pokemon_command(
 
         # Check if the swap would exceed points limit
         if new_total_points < 0:
+            logger.error(f"User {interaction.user.name} failed swap - Points limit exceeded")
             await interaction.followup.send(
                 f"❌ This swap would exceed the points limit for {coach_member.display_name}'s team.\n"
                 f"Current points: {draft_state['teams'][coach_member]['points']}\n"
@@ -1754,6 +1821,7 @@ async def swap_pokemon_command(
         new_pokemon_dex = pokemon_data[new_pokemon]["dex_number"]
         team_without_current = [p for p in draft_state["teams"][coach_member]["pokemon"] if p != current_pokemon]
         if any(pokemon_data[p]["dex_number"] == new_pokemon_dex for p in team_without_current):
+            logger.error(f"User {interaction.user.name} failed swap - Species clause violation")
             await interaction.followup.send(
                 f"❌ Cannot add {new_pokemon.capitalize()} due to Species Clause violation.",
                 ephemeral=True
@@ -1764,6 +1832,7 @@ async def swap_pokemon_command(
         if new_pokemon in stall_group:
             current_stall_count = sum(1 for p in team_without_current if p in stall_group)
             if current_stall_count >= 2:
+                logger.error(f"User {interaction.user.name} failed swap - Stall group limit exceeded")
                 await interaction.followup.send(
                     f"❌ Cannot add {new_pokemon.capitalize()} as it would exceed the stall group limit.",
                     ephemeral=True
@@ -1797,6 +1866,7 @@ async def swap_pokemon_command(
         await view.wait()
 
         if not view.value:
+            logger.error(f"User {interaction.user.name} failed swap - Confirmation timed out or cancelled")
             await interaction.followup.send(
                 "❌ Swap cancelled or timed out.",
                 ephemeral=True
@@ -1857,7 +1927,7 @@ async def swap_pokemon_command(
             ephemeral=True
         )
 
-# Autocomplete functions remain the same as in the previous version
+# Autocomplete functions tied to /swap_pokemon
 @swap_pokemon_command.autocomplete('coach')
 async def swap_coach_autocomplete(interaction: discord.Interaction, current: str):
     """
