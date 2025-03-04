@@ -1,6 +1,8 @@
 '''
 v0.54 - Added proper logging -OK
 v0.54.1 -Re-aranged pieces of code (func w/ func, scommands w/ scommands, etc.)
+
+v0.55 - removing /numberofcoaches and recoding /set_coaches - also removed fetch guild members at start
 '''
 
 import discord
@@ -27,6 +29,8 @@ from google.api_core.exceptions import DeadlineExceeded
 '''v0.53'''
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+'''v0.55'''
+from typing import Annotated 
 
 print("Current Working Directory:", os.getcwd())
 
@@ -79,7 +83,7 @@ remaining_times = {}
 # Global variable to store the selected coaches
 selected_coaches = []
 
-'''v0.50'''
+'''INITIALIZE'''
 #Function to Authenticate with Google Sheets
 def authenticate_google_sheets():
  
@@ -225,7 +229,6 @@ except Exception as e:
     exit(1)
 
 pokemon_names = list(pokemon_data.keys())
-
 
 #Function to Update Google Sheets
 def update_google_sheet(is_intentional_clear=False):
@@ -383,21 +386,6 @@ async def on_ready():
         logger.info(f'Synced {len(synced)} commands to guild {GUILD_ID.id}')
     except Exception as e:
         logger.info(f"Error syncing commands: {e}")
-    
-    # Fetch the guild and its members
-    guild = bot.get_guild(GUILD_ID.id)
-    if guild:
-        logger.info("Members in the guild:")
-        try:
-            # Fetch members explicitly
-            async for member in guild.fetch_members(limit=None):
-                logger.info(f"Username: {member.name}, Display Name: {member.display_name}")
-        except Exception as e:
-            logger.info(f"Error fetching members: {e}")
-    else:
-        logger.info(f"Guild with ID {GUILD_ID.id} not found.")
-
-'''Empieza V0.44'''
 
 '''HELPER FUNCTIONS'''
 ## Split Validations into Helper Functions##
@@ -481,22 +469,42 @@ async def show_final_teams(interaction: discord.Interaction):
 
 # Function to generate autocomplete choices for coaches
 async def coach_autocomplete(interaction: discord.Interaction, current: str):
+    logger.debug(f"Starting coach_autocomplete for {interaction.user.name}")
+    logger.debug(f"Current input: {current}")
+
     # Fetch members with the "Draft" role
     draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
     if not draft_role:
+        logger.error("Draft role not found in guild")
         return []
 
-    # Filter members with the "Draft" role and match the current input
+    # Get values of previous selections from the command data
+    used_ids = set()
+    command_data = interaction.data.get('options', [])
+    logger.debug(f"Command data: {command_data}")
+    
+    for option in command_data:
+        if isinstance(option.get('value'), str):
+            try:
+                used_ids.add(int(option['value']))
+            except (ValueError, KeyError):
+                pass
+
+    logger.debug(f"Already used coach IDs: {used_ids}")
+
+    # Filter members with the "Draft" role, match the current input, and exclude already selected coaches
     members = [member for member in interaction.guild.members if draft_role in member.roles]
+    logger.debug(f"Found {len(members)} members with Draft role")
+    
     choices = [
         app_commands.Choice(name=member.display_name, value=str(member.id))
         for member in members
-        if current.lower() in member.display_name.lower()
+        if current.lower() in member.display_name.lower() and member.id not in used_ids
     ][:25]  # Limit to 25 choices
 
+    logger.debug(f"Returning {len(choices)} choices: {[c.name for c in choices]}")
     return choices
 
-'''Empieza V0.45'''
 #Pokemon name validation - This function handles name checking and suggestions:
 async def validate_pokemon_name(interaction: discord.Interaction, pokemon_name: str, user) -> tuple[bool, dict]:
     """Validate pokemon name and return (is_valid, pokemon_info)"""
@@ -818,7 +826,7 @@ def has_reached_stall_limit(user):
     stall_count = sum(1 for pokemon in draft_state["teams"][user]["pokemon"] if pokemon in stall_group)
     return stall_count >= 2
 
-'''v0.52 VIEWS'''
+'''VIEWS'''
 #Class for ConfirmationView
 class ConfirmationView(discord.ui.View):
     """
@@ -869,7 +877,6 @@ class ConfirmationView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
-'''v0.46'''
 ##Confirmation View Class
 class PickConfirmationView(discord.ui.View):
     def __init__(self, remaining_time: int, timeout=30):
@@ -917,7 +924,6 @@ class PickConfirmationView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
-'''v0.51'''
 #Class for skip confirmation
 class SkipConfirmationView(discord.ui.View):
     def __init__(self, timeout=30):
@@ -964,99 +970,51 @@ class SkipConfirmationView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
-'''V0.47'''
+'''SLASH COMMANDS'''
 #slash command to set the number of coaches
-@bot.tree.command(name="numberofcoaches", description="Change the number of coaches allowed in the draft", guild=GUILD_ID)
-@app_commands.describe(new_size="The new number of coaches allowed in the draft (minimum 2)")
-@has_draft_staff_role()
-async def number_of_coaches_command(interaction: discord.Interaction, new_size: int):
-    global coaches_size
-    logger.info(f"{interaction.user.name} attempting to set number of coaches to {new_size}")
-
-    # Defer the response immediately to prevent timeout
-    await interaction.response.defer(ephemeral=True)
-
-    # Send initial status message and store the message for updates
-    status_message = await interaction.followup.send(
-        "⏳ Updating the number of coaches...\n□ Validating request\n□ Rebuilding commands\n□ Syncing with Discord",
-        ephemeral=True,
-        wait=True  # Wait for the message to be sent and get its reference
-    )
-
-    # Check if a draft is in progress or paused
-    if draft_state["participants"] or draft_state["is_paused"]:
-        logger.error(f"{interaction.user.name} failed to set coaches - Draft active or paused")
-        await status_message.edit(content="❌ Cannot change the number of coaches while a draft is in progress or paused.")
-        return
-
-    # Validate the new size (minimum 2)
-    if new_size < 2:
-        logger.error(f"{interaction.user.name} failed to set coaches - Invalid size {new_size}")
-        await status_message.edit(content="❌ The number of coaches must be at least **2**.")
-        return
-
-    try:
-        # Update the coaches_size variable
-        old_size = coaches_size
-        coaches_size = new_size
-
-        # Update status - Step 1 complete
-        await status_message.edit(content=(
-            "✓ Validating request... complete\n"
-            "⏳ Rebuilding commands...\n"
-            "□ Syncing with Discord"
-        ))
-
-        # Remove the existing set_coaches command
-        try:
-            bot.tree.remove_command("set_coaches", guild=GUILD_ID)
-            logger.info(f"{interaction.user.name} removed old set_coaches command")
-        except Exception:
-            pass  # Command might not exist yet
-
-        # Create and add the new set_coaches command
-        def create_dynamic_set_coaches():
-            # Create the parameters dictionary for app_commands.describe
-            params_dict = {
-                f"coach{i+1}": f"Coach #{i+1}" for i in range(coaches_size)
-            }
-            
-            # Create the function parameters as a string
-            func_params = ", ".join([
-                "interaction: discord.Interaction",
-                *[f"coach{i+1}: str = None" for i in range(coaches_size)]
-            ])
-            
-            # Create the coach parameters list for the command code
-            coach_params_list = [f"coach{i+1}" for i in range(coaches_size)]
-            coach_params_str = ", ".join(coach_params_list)
-            
-            # Create the command function code
-            command_code = f"""
-@has_draft_staff_role()
-async def set_coaches_command({func_params}):
+def generate_set_coaches_command():
+    logger.info(f"Generating set_coaches command for {coaches_size} coaches")
+    
+    # Generate the parameters for app_commands.describe
+    params_dict = {f"coach{i+1}": f"Coach #{i+1}" for i in range(coaches_size)}
+    
+    # Create the function parameters string
+    params_str = "interaction: discord.Interaction"
+    params_str += "".join(f", coach{i+1}: str" for i in range(coaches_size))
+    
+    # Create the coach values list for the function body
+    coach_values_str = ", ".join(f"coach{i+1}" for i in range(coaches_size))
+    
+    # Create the function body with proper escaping of format brackets
+    func_body = f"""
+async def set_coaches_command({params_str}):
     global selected_coaches
-    # Add defer at the start
+    logger.info(f"{{interaction.user.name}} attempting to set coaches")
+    
     await interaction.response.defer(ephemeral=True)
 
     # Check if a draft is already in progress
     if draft_state["participants"]:
+        logger.error(f"{{interaction.user.name}} failed to set coaches - Draft in progress")
         await interaction.followup.send("A draft is already in progress. You cannot change coaches now.", ephemeral=True)
         return
 
     # Validate that all selected members have the "Draft" role
     draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
     if not draft_role:
+        logger.error(f"{{interaction.user.name}} failed to set coaches - Draft role not found")
         await interaction.followup.send("The 'Draft' role does not exist in this server.", ephemeral=True)
         return
 
     # Resolve members from their IDs or names
     coaches = []
     seen_coaches = set()
-    coach_params = [{coach_params_str}]
     
-    for i, coach_id in enumerate(coach_params, 1):
+    coach_values = [{coach_values_str}]
+    
+    for i, coach_id in enumerate(coach_values, 1):
         if not coach_id:
+            logger.error(f"{{interaction.user.name}} failed to set coaches - Coach #{{i}} not provided")
             await interaction.followup.send(f"Coach #{{i}} is required.", ephemeral=True)
             return
 
@@ -1066,10 +1024,12 @@ async def set_coaches_command({func_params}):
             member = None
             
         if not member:
+            logger.error(f"{{interaction.user.name}} failed to set coaches - Coach #{{i}} not found")
             await interaction.followup.send(f"Could not find member for Coach #{{i}}", ephemeral=True)
             return
             
         if draft_role not in member.roles:
+            logger.error(f"{{interaction.user.name}} failed to set coaches - {{member.display_name}} missing Draft role")
             await interaction.followup.send(
                 f"{{member.display_name}} does not have the 'Draft' role and cannot be a coach.",
                 ephemeral=True
@@ -1078,6 +1038,7 @@ async def set_coaches_command({func_params}):
 
         # Check if this coach has already been selected
         if member.id in seen_coaches:
+            logger.error(f"{{interaction.user.name}} failed to set coaches - {{member.display_name}} selected multiple times")
             await interaction.followup.send(
                 f"❌ Error: {{member.display_name}} has been selected multiple times. Each coach can only be selected once.",
                 ephemeral=True
@@ -1087,74 +1048,37 @@ async def set_coaches_command({func_params}):
         seen_coaches.add(member.id)
         coaches.append(member)
 
-    # Validate the number of coaches
-    if len(coaches) != coaches_size:
-        await interaction.followup.send(
-            f"You must provide exactly {coaches_size} coaches.", 
-            ephemeral=True
-        )
-        return
-
     # Store the selected coaches
     selected_coaches = coaches
+    logger.info(f"{{interaction.user.name}} successfully set coaches: {{', '.join([c.display_name for c in selected_coaches])}}")
     await interaction.followup.send(
         f"Coaches set successfully: {{', '.join([c.mention for c in selected_coaches])}}"
     )
 """
+
+    # Create the command function using exec
+    namespace = {}
+    exec(func_body, globals(), namespace)
+    set_coaches_command = namespace['set_coaches_command']
     
-            # Create the function namespace
-            namespace = {}
-            exec(command_code, globals(), namespace)
-            dynamic_command = namespace['set_coaches_command']
-            
-            # Create the command
-            command = bot.tree.command(
-                name="set_coaches",
-                description=f"Set the {coaches_size} coaches for the draft",
-                guild=GUILD_ID
-            )(dynamic_command)
-            
-            # Add the descriptions
-            command = app_commands.describe(**params_dict)(command)
-            
-            # Add autocomplete for all coach arguments
-            for i in range(coaches_size):
-                command.autocomplete(f"coach{i+1}")(coach_autocomplete)
-            
-            return command
+    # Add the decorators
+    set_coaches_command = bot.tree.command(
+        name="set_coaches",
+        description=f"Set the {coaches_size} coaches for the draft",
+        guild=GUILD_ID
+    )(set_coaches_command)
+    set_coaches_command = has_draft_staff_role()(set_coaches_command)
+    set_coaches_command = app_commands.describe(**params_dict)(set_coaches_command)
 
-        # Create and add the new command
-        new_command = create_dynamic_set_coaches()
-        logger.info(f"{interaction.user.name} created new set_coaches command for {new_size} coaches")
+    # Apply the existing coach_autocomplete to each parameter
+    for i in range(coaches_size):
+        param_name = f"coach{i+1}"
+        set_coaches_command.autocomplete(param_name)(coach_autocomplete)
+    
+    return set_coaches_command
 
-        # Update status - Step 2 complete
-        await status_message.edit(content=(
-            "✓ Validating request... complete\n"
-            "✓ Rebuilding commands... complete\n"
-            "⏳ Syncing with Discord..."
-        ))
-        
-        # Sync the commands
-        await bot.tree.sync(guild=GUILD_ID)
-        logger.info(f"{interaction.user.name} synced commands successfully")
-
-        # Final success message
-        await status_message.edit(content=(
-            "✅ Command update complete!\n\n"
-            f"**Number of coaches updated:**\n"
-            f"• Previous: {old_size}\n"
-            f"• Current: {coaches_size}\n\n"
-            f"The `/set_coaches` command has been updated to accept **{coaches_size}** coaches."
-        ))
-        logger.info(f"{interaction.user.name} successfully updated number of coaches from {old_size} to {new_size}")
-
-    except Exception as e:
-        logger.error(f"{interaction.user.name} failed to update commands: {str(e)}")
-        await status_message.edit(content=(
-            "❌ An error occurred while updating the commands:\n"
-            f"```\n{str(e)}\n```\n"
-            "Please try again or contact the bot administrator."
-        ))
+# Generate the command at startup
+set_coaches_command = generate_set_coaches_command()
 
 # Slash command to start the draft (specific to the guild)
 @bot.tree.command(name="start_draft", description="Start the Pokémon draft", guild=GUILD_ID)
@@ -1189,7 +1113,6 @@ async def start_draft_command(interaction: discord.Interaction):
             ephemeral=True
         )
 
-'''v0.48'''
 #Slash command to stop the draft
 @bot.tree.command(
     name="stop_draft", 
@@ -1296,7 +1219,6 @@ async def stop_draft_command(interaction: discord.Interaction):
             "✅ Stop draft cancelled. The draft will continue normally.",
             ephemeral=True
         )
-
 
 #Slash command to skip coach turnn
 @bot.tree.command(name="skip", description="Skip the current player's turn (Draft Staff only)", guild=GUILD_ID)
