@@ -3,6 +3,8 @@ v0.54 - Added proper logging -OK
 v0.54.1 -Re-aranged pieces of code (func w/ func, scommands w/ scommands, etc.)
 
 v0.55 - removing /numberofcoaches and recoding /set_coaches - also removed fetch guild members at start
+
+v0.56 - adding security for Google Creds
 '''
 '''LIBRARIES'''
 import discord                          #Core Discord.py functionality 
@@ -21,6 +23,11 @@ from oauth2client.service_account import ServiceAccountCredentials #Used for Goo
 import os                                                          #Used for working directory and file paths
 from google.oauth2.service_account import Credentials              #Used for Google Drive API authentication and access
 from googleapiclient.discovery import build                        #Used for Google Drive API authentication and access
+from datetime import datetime, UTC      # For handling timezone-aware timestamps in token refresh and security validation
+from dataclasses import dataclass       # For creating the SecurityMetadata class with clean attribute definitions
+import secrets                          # For generating cryptographically strong random keys for instance tracking
+from cryptography.fernet import Fernet  # For encrypting sensitive data in memory (though currently not actively used)
+from typing import Optional             # For type hinting functions that might return None (like get_sheets_client)
 
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
@@ -39,7 +46,7 @@ draft_size = 4
 total_points = 400
 
 # Define the number of coaches allowed in the draft
-coaches_size = 16 # Default value
+coaches_size = 2 # Default value
 
 # Timer duration (in seconds)
 TIMER_DURATION = 60  # Default timer duration (1 minute)
@@ -74,26 +81,180 @@ intents.message_content = True
 intents.members = True  # Enable server members intent
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-#Function to Authenticate with Google Sheets
-def authenticate_google_sheets():
- 
-    try:
-        # Define the scope
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+#SecureGoogleServicesManager [v0.56] - block to Authenticate Google Sheets
+@dataclass
+class SecurityMetadata:
+    """Tracks security-related metadata for credentials"""
+    last_refresh: datetime
+    instance_id: str
+    initialization_time: datetime
+
+class SecureGoogleServicesManager:
+    """Manages Google service connections with enhanced security"""
+    
+    def __init__(self):
+        self._sheets_client = None
+        self._drive_service = None
+        self._credentials = None
+        self._security = None
+        # Generate unique instance ID for tracking
+        self._instance_key = secrets.token_urlsafe(32)
+        # Create encryption key for any sensitive data we might need to store
+        self._encryption_key = Fernet.generate_key()
+        self._cipher_suite = Fernet(self._encryption_key)
         
-        # Load credentials from the JSON file
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    def _encrypt_sensitive_data(self, data: str) -> bytes:
+        """Encrypt sensitive data before storing in memory"""
+        return self._cipher_suite.encrypt(data.encode())
         
-        # Authorize the client
-        client = gspread.authorize(creds)
-        logger.info("Successfully authenticated with Google Sheets.")
-        return client
-    except FileNotFoundError:
-        logger.error("Credentials file (credentials.json) not found.")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to authenticate with Google Sheets: {e}")
-        raise
+    def _decrypt_sensitive_data(self, encrypted_data: bytes) -> str:
+        """Decrypt sensitive data"""
+        return self._cipher_suite.decrypt(encrypted_data).decode()
+        
+    def initialize(self) -> bool:
+        """Initialize Google services with security tracking"""
+        try:
+            logger.info("Initializing Google services...")
+            
+            # Define the scope
+            scope = ["https://spreadsheets.google.com/feeds", 
+                    "https://www.googleapis.com/auth/drive"]
+            
+            # Load credentials from the JSON file
+            logger.info("Loading credentials from file...")
+            self._credentials = ServiceAccountCredentials.from_json_keyfile_name(
+                "credentials.json", 
+                scope
+            )
+            
+            # Initialize sheets client
+            logger.info("Authorizing sheets client...")
+            self._sheets_client = gspread.authorize(self._credentials)
+            
+            # Initialize drive service
+            logger.info("Initializing drive service...")
+            self._drive_service = build(
+                "drive", 
+                "v3",
+                credentials=Credentials.from_service_account_file(
+                    "credentials.json",
+                    scopes=["https://www.googleapis.com/auth/drive"]
+                ),
+                cache_discovery=False
+            )
+            
+            # Initialize security metadata with timezone-aware datetime
+            current_time = datetime.now(UTC)
+            self._security = SecurityMetadata(
+                last_refresh=current_time,
+                instance_id=self._instance_key,
+                initialization_time=current_time
+            )
+            
+            logger.info(
+                f"Successfully initialized Google services (Instance: {self._instance_key[:8]})"
+            )
+            return True
+            
+        except FileNotFoundError:
+            logger.error("Credentials file (credentials.json) not found")
+            self._cleanup()
+            return False
+        except Exception as e:
+            logger.error(
+                f"Failed to initialize Google services (Instance: {self._instance_key[:8]}): {e}"
+            )
+            self._cleanup()
+            return False
+                        
+    def _cleanup(self):
+        """Clean up sensitive data"""
+        self._sheets_client = None
+        self._drive_service = None
+        self._credentials = None
+        import gc
+        gc.collect()
+            
+    def force_refresh(self) -> bool:
+        """Force a refresh of credentials with security checks"""
+        try:
+            if not self._security or self._security.instance_id != self._instance_key:
+                logger.error("Security validation failed - instance mismatch")
+                return False
+                
+            if self._credentials:
+                logger.info(f"Refreshing token at {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                self._credentials.refresh()
+                self._sheets_client = gspread.authorize(self._credentials)
+                self._security.last_refresh = datetime.now(UTC)
+                logger.info(
+                    f"Token refresh successful (Instance: {self._instance_key[:8]})"
+                )
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Force refresh failed: {e}")
+            return False
+            
+    def get_sheets_client(self) -> Optional[gspread.Client]:
+        """Get sheets client with security checks"""
+        if not self._validate_security():
+            return None
+            
+        try:
+            # Check if token needs refresh
+            if self._credentials.access_token_expired:
+                if not self.force_refresh():
+                    return None
+                    
+            # Check for token age (12 hours)
+            token_age = datetime.now(UTC) - self._security.last_refresh
+            if token_age.total_seconds() > 43200:  # 12 hours
+                logger.warning(
+                    f"Token age exceeds 12 hours (Instance: {self._instance_key[:8]}), forcing refresh"
+                )
+                if not self.force_refresh():
+                    return None
+                    
+            return self._sheets_client
+            
+        except Exception as e:
+            logger.error(
+                f"Error getting sheets client (Instance: {self._instance_key[:8]}): {e}"
+            )
+            return None
+            
+    def get_drive_service(self):
+        """Get drive service with security checks"""
+        if not self._validate_security():
+            return None
+        return self._drive_service
+        
+    def _validate_security(self) -> bool:
+        """Validate security state"""
+        if not self._security:
+            logger.error("Security metadata missing")
+            return False
+            
+        if self._security.instance_id != self._instance_key:
+            logger.error("Instance ID mismatch - possible security issue")
+            return False
+            
+        # Check initialization age (24 hours)
+        init_age = datetime.now(UTC) - self._security.initialization_time
+        if init_age.total_seconds() > 86400:  # 24 hours
+            logger.warning("Security timeout - requiring reinitialization")
+            return self.initialize()
+            
+        return True
+
+# Initialize Google Services Manager
+google_services = SecureGoogleServicesManager()
+if not google_services.initialize():
+    logger.error("Failed to initialize Google Services Manager")
+    exit(1)  # Exit if we can't initialize Google services
 
 # Function to create a 6x2 grid collage with the user's avatar in position (1,1)
 def create_sprite_collage(pokemon_names, pokemon_data, avatar_url):
@@ -139,23 +300,26 @@ def create_sprite_collage(pokemon_names, pokemon_data, avatar_url):
     collage.save("collage.png")
     return "collage.png"
 
-# Function to Load Pokémon data from Google Sheets
+# Block to Load Pokémon data from Google Sheets
 def load_pokemon_data_from_google_sheets():
     """
     Load Pokémon data from a Google Sheet named "Pokemon Data" in a specific folder.
     """
     pokemon_data = {}
     try:
-        # Authenticate with Google Sheets
-        client = authenticate_google_sheets()
+        # Get client from cached manager
+        client = google_services.get_sheets_client()
+        if not client:
+            raise Exception("Failed to get Google Sheets client")
         
         # Define the folder ID and sheet name
         folder_id = "13B6DevETQRkLON7yuonkpAHiar0NwwyU"  # Replace with your folder ID
         sheet_name = "Pokemon Data"  # Replace with your sheet name
         
-        # Authenticate with Google Drive
-        creds = Credentials.from_service_account_file("credentials.json", scopes=["https://www.googleapis.com/auth/drive"])
-        drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        # Get drive service from cached manager
+        drive_service = google_services.get_drive_service()
+        if not drive_service:
+            raise Exception("Failed to get Google Drive service")
         
         # List files in the folder
         query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
@@ -210,6 +374,11 @@ def load_pokemon_data_from_google_sheets():
 
 # Load Pokémon data from Google Sheets
 try:
+    # Verify Google services are initialized
+    if not google_services._security:
+        logger.error("Google services not properly initialized")
+        exit(1)
+        
     pokemon_data = load_pokemon_data_from_google_sheets()
     if not pokemon_data:
         logger.error("Failed to load Pokémon data. Exiting.")
@@ -223,12 +392,12 @@ pokemon_names = list(pokemon_data.keys())
 #Function to Update Google Sheets
 def update_google_sheet(is_intentional_clear=False):
     try:
-        # Authenticate with Google Sheets
-        client = authenticate_google_sheets()
+        # Get cached clients
+        client = google_services.get_sheets_client()
+        drive_service = google_services.get_drive_service()
         
-        # Authenticate with Google Drive
-        creds = Credentials.from_service_account_file("credentials.json", scopes=["https://www.googleapis.com/auth/drive"])
-        drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        if not client or not drive_service:
+            raise Exception("Failed to get Google services")
         
         # Define the folder ID and sheet name
         folder_id = "13B6DevETQRkLON7yuonkpAHiar0NwwyU"  # Replace with your folder ID
@@ -371,6 +540,12 @@ def has_draft_staff_role():
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
+    
+    # Initialize Google services
+    if not google_services.initialize():
+        logger.error("Failed to initialize Google services. Bot may not function correctly.")
+        return
+        
     try:
         synced = await bot.tree.sync(guild=GUILD_ID)
         logger.info(f'Synced {len(synced)} commands to guild {GUILD_ID.id}')
