@@ -4,36 +4,57 @@ v0.54.1 -Re-aranged pieces of code (func w/ func, scommands w/ scommands, etc.)
 
 v0.55 - removing /numberofcoaches and recoding /set_coaches - also removed fetch guild members at start
 '''
+'''LIBRARIES'''
+import discord                          #Core Discord.py functionality 
+from discord import app_commands        #Used throughout for bot commands and interactions
+from discord.ext import commands        #Used throughout for bot commands and interactions
+import pandas as pd                     #For pandas usage in load_pokemon_data_from_google_sheets() ONLY
+import taken                            #Custom module for storing the bot token
+import difflib                          #Used for Pokémon name suggestions in validate_pokemon_name() and swap_pokemon_command()
+from PIL import Image                   #Used for creating team collages in create_sprite_collage()
+import requests                         #Used for fetching Pokémon sprites and avatars
+from io import BytesIO                  #Used with PIL for image processing
+import asyncio                          #Used for timer functionality throughout the draft
+import logging                          #Used throughout for debug and error logging
+import gspread                                                     #Used for Google Sheets integration
+from oauth2client.service_account import ServiceAccountCredentials #Used for Google Sheets integration
+import os                                                          #Used for working directory and file paths
+from google.oauth2.service_account import Credentials              #Used for Google Drive API authentication and access
+from googleapiclient.discovery import build                        #Used for Google Drive API authentication and access
 
-import discord
-from discord import app_commands
-from discord.ext import commands
-import pandas as pd
-import taken  # Custom module for storing the bot token
-import difflib  # For finding similar Pokémon names
-from PIL import Image
-import requests
-from io import BytesIO
-import asyncio  # For the timer functionality
-import logging
-'''v0.46'''
-from discord.ui import Button, View
-'''v0.49'''
-from discord.app_commands import CheckFailure
-'''v0.50'''
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import os
-from google.auth.exceptions import TransportError
-from google.api_core.exceptions import DeadlineExceeded
-'''v0.53'''
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-'''v0.55'''
-from typing import Annotated 
+print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
-print("Current Working Directory:", os.getcwd())
+'''GLOBAL VARIABLES'''
+# Set the maximum number of timer extensions allowed per participant
+extensions_limit = 3  # You can adjust this value
 
+# Set the guild ID for the slash commands
+GUILD_ID = discord.Object(id=1326634506605691080)  # Replace with your guild ID
+
+# Define the stall group (replace with actual Pokémon names)
+stall_group = ["blissey", "toxapex", "skarmory", "chansey","clefable","clodsire","corviknight","cresselia","dondozo","garganacl","gliscor","mandibuzz","quagsire","slowking-galar"]
+
+# Set variable for number of Pokémon per Draft
+draft_size = 4
+total_points = 400
+
+# Define the number of coaches allowed in the draft
+coaches_size = 16 # Default value
+
+# Timer duration (in seconds)
+TIMER_DURATION = 60  # Default timer duration (1 minute)
+timer_task = None  # Global variable to store the timer task
+
+# Dictionary to store timers for each participant
+participant_timers = {}
+
+# Global variable to track remaining time for each participant
+remaining_times = {}
+
+# Global variable to store the selected coaches
+selected_coaches = []
+
+'''INITIALIZE'''
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,  # Set the logging level to INFO
@@ -53,37 +74,6 @@ intents.message_content = True
 intents.members = True  # Enable server members intent
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-'''GLOBAL VARIABLES'''
-# Set the maximum number of timer extensions allowed per participant
-extensions_limit = 3  # You can adjust this value
-
-# Set the guild ID for the slash commands
-GUILD_ID = discord.Object(id=1326634506605691080)  # Replace with your guild ID
-
-# Define the stall group (replace with actual Pokémon names)
-stall_group = ["blissey", "toxapex", "skarmory", "chansey","clefable","clodsire","corviknight","cresselia","dondozo","garganacl","gliscor","mandibuzz","quagsire","slowking-galar"]
-
-# Set variable for number of Pokémon per Draft
-draft_size = 4
-total_points = 400
-
-# Define the number of coaches allowed in the draft
-coaches_size = 4  # Default value
-
-# Timer duration (in seconds)
-TIMER_DURATION = 60  # Default timer duration (1 minute)
-timer_task = None  # Global variable to store the timer task
-
-# Dictionary to store timers for each participant
-participant_timers = {}
-
-# Global variable to track remaining time for each participant
-remaining_times = {}
-
-# Global variable to store the selected coaches
-selected_coaches = []
-
-'''INITIALIZE'''
 #Function to Authenticate with Google Sheets
 def authenticate_google_sheets():
  
