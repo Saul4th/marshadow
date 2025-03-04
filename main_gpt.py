@@ -3,8 +3,6 @@
 v0.52 - Added the modify team option - OK
 
 v0.53 - Loading Pokemon Data from Gsheets -OK
-
-v0.54 - Improve logging
 '''
 
 import discord
@@ -31,8 +29,6 @@ from google.api_core.exceptions import DeadlineExceeded
 '''v0.53'''
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-'''v0.54'''
-from logging.handlers import RotatingFileHandler
 
 print("Current Working Directory:", os.getcwd())
 
@@ -42,7 +38,7 @@ logging.basicConfig(
     level=logging.INFO,  # Set the logging level to INFO
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",  # Define the log format
     handlers=[
-        RotatingFileHandler("draft_bot.log", maxBytes=5 * 1024 * 1024, backupCount=3),  # Log to a file (5 MB per file, keep 3 backups)
+        logging.FileHandler("draft_bot.log"),  # Log to a file
         logging.StreamHandler()  # Log to the console
     ]
 )
@@ -657,13 +653,9 @@ def has_reached_stall_limit(user):
 @has_draft_staff_role()
 async def number_of_coaches_command(interaction: discord.Interaction, new_size: int):
     global coaches_size
-    
+
     # Defer the response immediately to prevent timeout
     await interaction.response.defer(ephemeral=True)
-
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /numberofcoaches with new_size: {new_size}."
-    )
 
     # Send initial status message and store the message for updates
     status_message = await interaction.followup.send(
@@ -847,10 +839,6 @@ async def start_draft_command(interaction: discord.Interaction):
     # Defer the response immediately to prevent interaction timeout
     await interaction.response.defer()
 
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /start_draft."
-    )
-
     # Check if coaches have been set
     if not selected_coaches:
         await interaction.followup.send("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
@@ -883,10 +871,6 @@ async def stop_draft_command(interaction: discord.Interaction):
     # Defer the response to prevent timeout
     await interaction.response.defer(ephemeral=True)
     
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /stop_draft."
-    )
-
     # Send warning message with confirmation buttons
     view = ConfirmationView(timeout=60)  # Using our improved ConfirmationView
     
@@ -952,8 +936,7 @@ async def stop_draft_command(interaction: discord.Interaction):
                 "✅ Draft has been completely stopped and reset.\n\n"
                 "• All timers have been cancelled\n"
                 "• All draft data has been cleared\n"
-                "• The bot is ready for a new draft", 
-                ephemeral=True
+                "• The bot is ready for a new draft"
             )
                 
             # Optional: Send a message to the channel that the draft was stopped
@@ -1254,9 +1237,6 @@ async def skip_command(interaction: discord.Interaction):
     # Defer immediately since we'll do multiple operations
     await interaction.response.defer()
 
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /skip."
-    )
     # Get the current participant that will be skipped
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
 
@@ -1348,10 +1328,6 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
     global participant_timers, remaining_times
     user = interaction.user
     
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /pick with Pokémon: {pokemon_name}."
-    )
-
     # --- 1. Initial validations ---
     if not await validate_draft_state(interaction, user):
         return
@@ -1515,11 +1491,6 @@ async def pokemon_name_autocomplete(interaction: discord.Interaction, current: s
 @bot.tree.command(name="clear", description="Clear all messages in the current channel", guild=GUILD_ID)
 @has_draft_staff_role()
 async def clear_messages_command(interaction: discord.Interaction):
-
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /clear."
-    )
-
     if draft_state["is_paused"]:
         await interaction.response.send_message("The draft is currently paused. Messages can't be deleted at this moment.", ephemeral=True)
         return
@@ -1545,10 +1516,6 @@ async def clear_messages_command(interaction: discord.Interaction):
 async def pause_draft_command(interaction: discord.Interaction):
     global draft_state
 
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /pause_draft."
-    )
-
     # Check if a draft is in progress
     if not draft_state["participants"]:
         await interaction.response.send_message("No draft is currently in progress. Start a draft first using `/start_draft`.", ephemeral=True)
@@ -1573,10 +1540,6 @@ async def pause_draft_command(interaction: discord.Interaction):
 @has_draft_staff_role()
 async def resume_draft_command(interaction: discord.Interaction):
     global draft_state
-
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /resume_draft."
-    )
 
     # Check if a draft is in progress
     if not draft_state["participants"]:
@@ -1604,10 +1567,6 @@ async def resume_draft_command(interaction: discord.Interaction):
 @has_draft_role()
 async def my_draft_command(interaction: discord.Interaction):
     user = interaction.user
-
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /my_draft."
-    )
 
     # Check if a draft is in progress
     if not draft_state["participants"]:
@@ -1706,9 +1665,6 @@ async def swap_pokemon_command(
     # Defer response due to potentially longer processing time
     await interaction.response.defer(ephemeral=True)
     
-    logger.info(
-        f"User {interaction.user.name} (ID: {interaction.user.id}) used /swap_pokemon with coach: {coach}, current_pokemon: {current_pokemon}, new_pokemon: {new_pokemon}."
-    )
     try:
         # Validate draft state and pause status
         if not draft_state["participants"]:
