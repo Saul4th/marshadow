@@ -26,7 +26,6 @@ from googleapiclient.discovery import build                        #Used for Goo
 from datetime import datetime, UTC      # For handling timezone-aware timestamps in token refresh and security validation
 from dataclasses import dataclass       # For creating the SecurityMetadata class with clean attribute definitions
 import secrets                          # For generating cryptographically strong random keys for instance tracking
-from cryptography.fernet import Fernet  # For encrypting sensitive data in memory (though currently not actively used)
 from typing import Optional             # For type hinting functions that might return None (like get_sheets_client)
 
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
@@ -99,17 +98,6 @@ class SecureGoogleServicesManager:
         self._security = None
         # Generate unique instance ID for tracking
         self._instance_key = secrets.token_urlsafe(32)
-        # Create encryption key for any sensitive data we might need to store
-        self._encryption_key = Fernet.generate_key()
-        self._cipher_suite = Fernet(self._encryption_key)
-        
-    def _encrypt_sensitive_data(self, data: str) -> bytes:
-        """Encrypt sensitive data before storing in memory"""
-        return self._cipher_suite.encrypt(data.encode())
-        
-    def _decrypt_sensitive_data(self, encrypted_data: bytes) -> str:
-        """Decrypt sensitive data"""
-        return self._cipher_suite.decrypt(encrypted_data).decode()
         
     def initialize(self) -> bool:
         """Initialize Google services with security tracking"""
