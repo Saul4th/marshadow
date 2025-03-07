@@ -6,7 +6,16 @@ v0.55 - removing /numberofcoaches and recoding /set_coaches - also removed fetch
 
 v0.56 - adding security for Google Creds
 
-v0.57 - New Attempt to implement Draft State for when the bot goes down
+v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway there
+
+    Timers look like are restored ok now and draft state as well. A few things to check like the restoring with coacches 0
+    Also need to replicate the Google Sheets update ->skipping turn only 6 places update
+    also need to check the ephemeral marked embeds that are not being ephemeral (skip)
+    no need to show Extensions in GS
+    Lastly check why the commands in draft_state_commands.py arent showing and see which are useful
+    an option to load and not just auto-load the latest .json looks like a good option
+
+Once finished, new version should be v0.6
 '''
 '''LIBRARIES'''
 import discord                          #Core Discord.py functionality 
@@ -585,6 +594,10 @@ class AutoSaver:
                     await asyncio.sleep(self.save_interval)
                     continue  # Skip this iteration and check again after interval
 
+                # Capture current timer state before saving
+                current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
+                await capture_timer_state(current_user)
+
                 # Debug logging to check state
                 logger.info("Auto-save check conditions:")
                 logger.info(f"Has participants: {bool(draft_state.get('participants'))}")
@@ -1154,7 +1167,7 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
         logger.info(f"Starting new timer for {participant.name}: {adjusted_duration} seconds")
 
     remaining_time = adjusted_duration
-
+    remaining_times[participant] = remaining_time  # <-- Add this line or delete if timers
     # Send an initial message with the timer
     timer_message = await interaction.followup.send(
         f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**"
@@ -1305,6 +1318,20 @@ def has_reached_stall_limit(user):
     """
     stall_count = sum(1 for pokemon in draft_state["teams"][user]["pokemon"] if pokemon in stall_group)
     return stall_count >= 2
+
+#Function to capture timer state:
+async def capture_timer_state(participant):
+    """Captures current remaining time from an active timer"""
+    if participant in participant_timers:
+        timer_task = participant_timers[participant]
+        if not timer_task.done():
+            for frame in timer_task.get_stack():
+                frame_locals = frame.f_locals
+                if 'remaining_time' in frame_locals:
+                    remaining_times[participant] = frame_locals['remaining_time']
+                    logger.info(f"Captured current remaining time for {participant.name}: {frame_locals['remaining_time']} seconds")
+                    return frame_locals['remaining_time']
+    return None
 
 '''VIEWS'''
 #Class for ConfirmationView
@@ -1678,6 +1705,11 @@ async def stop_draft_command(interaction: discord.Interaction):
         return
 
     try:
+        # First capture remaining times for any active timers
+        if draft_state["order"]:
+            current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
+            await capture_timer_state(current_user)
+
         # Handle saving if requested
         save_message = ""
         if should_save:
