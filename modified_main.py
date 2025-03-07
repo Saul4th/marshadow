@@ -8,7 +8,8 @@ v0.56 - adding security for Google Creds
 
 v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway there
 
-    Timers look like are restored ok now and draft state as well. A few things to check like the restoring with coacches 0
+    Timers look like are restored ok now and draft state as well. A few things to check like 
+    the restoring with coacches 0 -WIP (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
     Also need to replicate the Google Sheets update ->skipping turn only 6 places update
     also need to check the ephemeral marked embeds that are not being ephemeral (skip)
     no need to show Extensions in GS
@@ -76,9 +77,6 @@ participant_timers = {}
 
 # Global variable to track remaining time for each participant
 remaining_times = {}
-
-# Global variable to store the selected coaches
-selected_coaches = []
 
 '''INITIALIZE'''
 # Configure logging
@@ -487,15 +485,17 @@ def update_google_sheet(is_intentional_clear=False):
 
 # Draft state
 draft_state = {
-    "participants": [],  # List of participants
-    "order": [],  # Draft order
-    "current_pick": 0,  # Index of the current pick
-    "teams": {},  # Teams of each participant
-    "available_pokemon": pokemon_names.copy(),  # Pokémon available for drafting
-    "skipped_turns": {},  # Track skipped turns for each participant
-    "extensions": {},  # Track the number of timer extensions for each participant by failed pick
-    "is_paused": False,  # Track if the draft is paused
-    "auto_extensions": {},  # Track automatic extensions per participant by unconfirmed pick
+    'draft_channel_id': None,   #Unsure if this should be here
+    'participants': [],           # Will now hold both setup and active participants
+    'order': [],
+    'current_pick': 0,
+    'teams': {},
+    'available_pokemon': pokemon_names.copy(),
+    'skipped_turns': {},
+    'extensions': {},
+    'is_paused': False,
+    'auto_extensions': {},
+    'draft_phase': 'setup'       # New field: 'setup', 'active', or 'inactive'
 }
 
 #Error Handler
@@ -625,7 +625,6 @@ class AutoSaver:
                     
                     filename = self.state_manager.save_state(
                         draft_state,
-                        selected_coaches,
                         remaining_times
                     )
                     current_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -679,7 +678,6 @@ def handle_exit(signum, frame):
             # Now save state with updated remaining_times
             filename = state_manager.save_state(
                 draft_state,
-                selected_coaches,
                 remaining_times
             )
             logger.info(f"Successfully saved draft state to {filename} during shutdown")
@@ -695,7 +693,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 # Modify your on_ready event
 @bot.event
 async def on_ready():
-    global draft_state, selected_coaches, remaining_times, participant_timers
+    global draft_state, remaining_times, participant_timers
     
     logger.info(f'Logged in as {bot.user}')
     
@@ -741,7 +739,7 @@ async def on_ready():
             logger.info(f"Found recovery state: {latest_state}")
             
             # Load the state
-            loaded_state, loaded_coaches, loaded_times = state_manager.load_state(
+            loaded_state, loaded_times = state_manager.load_state(
                 latest_state,
                 guild
             )
@@ -752,7 +750,6 @@ async def on_ready():
                 
             # Update global state
             draft_state.update(loaded_state)
-            selected_coaches = loaded_coaches
             
             # Clear any existing timers from previous session
             participant_timers.clear()
@@ -826,13 +823,14 @@ async def on_ready():
                     else:
                         logger.warning(f"No valid remaining time found for {current_participant.name} in loaded_times")
                         
-            logger.info(f"Successfully recovered draft state with {len(selected_coaches)} coaches")
+            logger.info(f"Successfully recovered draft state with {len(draft_state['participants'])} coaches")
             
             # Log the current draft state
             logger.info(f"Current pick: {draft_state['current_pick']}")
             if draft_state['order']:
                 current_drafter = draft_state['order'][draft_state['current_pick']]
                 logger.info(f"Current drafter: {current_drafter.name if current_drafter else 'None'}")
+            logger.info(f"Draft phase: {draft_state.get('draft_phase', 'setup')}")
             logger.info(f"Draft is {'paused' if draft_state['is_paused'] else 'active'}")
             
     except Exception as e:
@@ -911,6 +909,7 @@ async def show_final_teams(interaction: discord.Interaction):
         # Mark draft as complete by clearing order
         draft_state["order"] = []
         draft_state["current_pick"] = 0
+        draft_state["draft_phase"] = "setup"  # Reset phase to setup
 
          # Stop auto-save
         await auto_saver.stop()
@@ -1071,21 +1070,16 @@ def process_pick(user: discord.Member, pokemon_name: str, pokemon_info: dict) ->
  
 # Function to start the draft (updated in v0.50)
 async def start_draft(interaction: discord.Interaction, participants: list[discord.Member]):
-    global selected_coaches
 
     try:
 
         # Reset the draft state
-        draft_state["participants"] = participants
         draft_state["order"] = participants + participants[::-1]  # Snake draft order
         draft_state["current_pick"] = 0
         draft_state["teams"] = {member: {"pokemon": [], "points": total_points} for member in participants}
         draft_state["available_pokemon"] = pokemon_names.copy()
         draft_state["skipped_turns"] = {member: 0 for member in participants}
         draft_state["draft_channel_id"] = interaction.channel.id
-
-        # Clear the selected coaches list
-        selected_coaches = []
 
         # Update the Google Sheet
         try:
@@ -1112,6 +1106,7 @@ async def start_draft(interaction: discord.Interaction, participants: list[disco
             "An error occurred while starting the draft. Please try again or contact the administrator.",
             ephemeral=True
         )
+        draft_state["draft_phase"] = "setup"
     await auto_saver.start()
 
 #Funtion to format the timer
@@ -1495,15 +1490,15 @@ def generate_set_coaches_command():
     # Create the function body with proper escaping of format brackets
     func_body = f"""
 async def set_coaches_command({params_str}):
-    global selected_coaches
+    global draft_state
     logger.info(f"{{interaction.user.name}} attempting to set coaches")
     
     await interaction.response.defer(ephemeral=True)
 
     # Check if a draft is already in progress
-    if draft_state["participants"]:
-        logger.error(f"{{interaction.user.name}} failed to set coaches - Draft in progress")
-        await interaction.followup.send("A draft is already in progress. You cannot change coaches now.", ephemeral=True)
+    if draft_state['draft_phase'] != 'setup':
+        logger.error(f"{{interaction.user.name}} failed to set coaches - Draft not in setup phase")
+        await interaction.followup.send("Cannot set coaches now. Draft must be in setup phase.", ephemeral=True)
         return
 
     # Validate that all selected members have the "Draft" role
@@ -1556,10 +1551,10 @@ async def set_coaches_command({params_str}):
         coaches.append(member)
 
     # Store the selected coaches
-    selected_coaches = coaches
-    logger.info(f"{{interaction.user.name}} successfully set coaches: {{', '.join([c.display_name for c in selected_coaches])}}")
+    draft_state['participants'] = coaches
+    logger.info(f"{{interaction.user.name}} successfully set coaches: {{', '.join([c.display_name for c in draft_state['participants']])}}")
     await interaction.followup.send(
-        f"Coaches set successfully: {{', '.join([c.mention for c in selected_coaches])}}"
+        f"Coaches set successfully: {{', '.join([c.mention for c in draft_state['participants']])}}"
     )
 """
 
@@ -1590,28 +1585,29 @@ set_coaches_command = generate_set_coaches_command()
 # Slash command to start the draft (specific to the guild)
 @bot.tree.command(name="start_draft", description="Start the Pokémon draft", guild=GUILD_ID)
 async def start_draft_command(interaction: discord.Interaction):
-    global selected_coaches
+    global draft_state
     logger.info(f"{interaction.user.name} attempting to start draft")
 
     # Defer the response immediately to prevent interaction timeout
     await interaction.response.defer()
-
-    # Check if coaches have been set
-    if not selected_coaches:
-        logger.error(f"{interaction.user.name} failed to start draft - No coaches selected")
-        await interaction.followup.send("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
-        return
-
+   
     # Check if a draft is already in progress
-    if draft_state["participants"]:
+    if draft_state["draft_phase"] != "setup":
         logger.error(f"{interaction.user.name} failed to start draft - Draft already in progress")
         await interaction.followup.send("A draft is already in progress. Please wait until the current draft finishes before starting a new one.", ephemeral=True)
         return
+    
+    # Check if coaches have been set
+    if not draft_state['participants']:
+        logger.error(f"{interaction.user.name} failed to start draft - No coaches set")
+        await interaction.followup.send("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
+        return
 
     try:
-        # Start the draft with the selected coaches
-        await start_draft(interaction, selected_coaches)
-        coach_names = [coach.name for coach in selected_coaches]
+        # Start the draft with the set coaches
+        draft_state['draft_phase'] = 'active'
+        await start_draft(interaction, draft_state['participants'])
+        coach_names = [coach.name for coach in draft_state['participants']]
         logger.info(f"{interaction.user.name} successfully started draft with coaches: {', '.join(coach_names)}")
     except Exception as e:
         logger.error(f"{interaction.user.name} failed to start draft - Error: {str(e)}")
@@ -1628,10 +1624,17 @@ async def start_draft_command(interaction: discord.Interaction):
 )
 @has_draft_staff_role()
 async def stop_draft_command(interaction: discord.Interaction):
-    global participant_timers, remaining_times, draft_state, selected_coaches, auto_saver  # All globals at the top
+    global  draft_state,participant_timers, remaining_times, auto_saver  # All globals at the top
     logger.info(f"{interaction.user.name} attempting emergency draft stop")
     await interaction.response.defer(ephemeral=True)
     
+    if draft_state['draft_phase'] == 'inactive':
+        await interaction.response.send_message(
+            "No draft is currently active.", 
+            ephemeral=True
+        )
+        return
+
     # Send initial message with save options
     save_options_embed = discord.Embed(
         title="⚠️ Draft Stop Options",
@@ -1716,8 +1719,7 @@ async def stop_draft_command(interaction: discord.Interaction):
             try:
                 filename = state_manager.save_state(
                     draft_state,
-                    selected_coaches,
-                    remaining_times
+                    remaining_times  
                 )
                 logger.info(f"{interaction.user.name} saved draft state as {filename}")
                 save_message = f"\n✅ Draft state saved as `{filename}`"
@@ -1754,9 +1756,9 @@ async def stop_draft_command(interaction: discord.Interaction):
             "skipped_turns": {},
             "extensions": {},
             "is_paused": False,
-            "auto_extensions": {}
+            "auto_extensions": {},
+            "draft_phase": "setup"  # Add this line
         }
-        selected_coaches = []
         
         # Update Google Sheets
         try:
