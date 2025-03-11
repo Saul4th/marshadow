@@ -8,11 +8,11 @@ v0.56 - adding security for Google Creds
 
 v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway there
 
-    Timers look like are restored ok now and draft state as well. A few things to check like 
-    the restoring with coacches 0 -WIP (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
-    Also need to replicate the Google Sheets update ->skipping turn only 6 places update
+   0.57.1 Timers look like are restored ok now and draft state as well. A few things to check like 
+   0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
+   0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
+   0.57.4 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -PENDING
     also need to check the ephemeral marked embeds that are not being ephemeral (skip)
-    no need to show Extensions in GS
     Lastly check why the commands in draft_state_commands.py arent showing and see which are useful
     an option to load and not just auto-load the latest .json looks like a good option
 
@@ -428,57 +428,80 @@ def update_google_sheet(is_intentional_clear=False):
         # Open the Google Sheet by ID
         spreadsheet = client.open_by_key(sheet_id)
         
-        # Clear the Pokémon picks sheet
-        pokemon_sheet = spreadsheet.sheet1  # First sheet (Pokémon picks)
+       # Clear the sheet
+        pokemon_sheet = spreadsheet.sheet1
         pokemon_sheet.clear()
-        logger.info("Cleared Pokémon picks sheet.")
-        
-        # Add headers for the Pokémon picks sheet
-        pokemon_sheet.append_row(["Coach", "Pokémon", "Points"])
-        logger.info("Added headers to Pokémon picks sheet.")
-        
-        # Check if draft state is valid
+        logger.info("Cleared sheet.")
+
+        # We'll use batch_update to set specific ranges
+        batch_data = []
+
+        # First row - section headers
+        batch_data.append({
+            'range': 'A1:E1',
+            'values': [["Draft Status", "", "", "", "Skips Tracking"]]
+        })
+
+        # Second row - column headers
+        batch_data.append({
+            'range': 'A2:F2',
+            'values': [["Coach", "Pokemon", "Points", "", "Coach", "Skips"]]
+        })
+
+        # Prepare data arrays
+        picks_data = []
         if draft_state.get("teams"):
             for coach, team in draft_state["teams"].items():
                 for pokemon in team["pokemon"]:
-                    pokemon_points = pokemon_data[pokemon]["points"]
-                    pokemon_sheet.append_row([coach.display_name, pokemon, pokemon_points])
-            logger.info("Updated Pokémon picks sheet with draft data.")
-        elif not is_intentional_clear:
-            # Only log a warning if the draft state is empty unintentionally
-            logger.warning("Draft state is empty. Skipping Pokémon picks update.")
-        
-        # Clear the draft state sheet
-        draft_state_sheet = spreadsheet.worksheet("Draft State")  # Second sheet (Draft State)
-        draft_state_sheet.clear()
-        logger.info("Cleared Draft State sheet.")
-        
-        # Add headers for the draft state sheet
-        draft_state_sheet.append_row(["Participants", "Current Pick", "Remaining Pokémon", "Skipped Turns", "Extensions", "Auto Extensions"])
-        logger.info("Added headers to Draft State sheet.")
-        
-        # Add draft state data (if available)
+                    picks_data.append([
+                        coach.display_name,
+                        pokemon,
+                        pokemon_data[pokemon]["points"]
+                    ])
+
+        skips_data = []
         if draft_state.get("participants"):
-            participants = ", ".join([p.display_name for p in draft_state["participants"]])
-            
-            # New code: Handle empty order list or draft completion
-            order_length = len(draft_state.get("order", []))
-            if order_length > 0 and "current_pick" in draft_state:
-                current_pick = draft_state["order"][draft_state["current_pick"] % order_length].display_name
+            for participant in draft_state["participants"]:
+                skips_data.append([
+                    participant.display_name,
+                    draft_state["skipped_turns"].get(participant, 0)
+                ])
+
+        # Combine data with specific range assignments
+        max_rows = max(len(picks_data), len(skips_data))
+        
+        # Draft data (A3:C{max_rows+2})
+        draft_values = []
+        for i in range(max_rows):
+            if i < len(picks_data):
+                draft_values.append(picks_data[i])
             else:
-                current_pick = "Draft Complete"
-            # [Rest of the function remains exactly the same]
-            remaining_pokemon = len(draft_state["available_pokemon"])
-            skipped_turns = ", ".join([f"{p.display_name}: {t}" for p, t in draft_state["skipped_turns"].items()])
-            extensions = ", ".join([f"{p.display_name}: {e}" for p, e in draft_state["extensions"].items()])
-            auto_extensions = ", ".join([f"{p.display_name}: {a}" for p, a in draft_state["auto_extensions"].items()])
-            
-            draft_state_sheet.append_row([participants, current_pick, remaining_pokemon, skipped_turns, extensions, auto_extensions])
-            logger.info("Updated Draft State sheet with draft data.")
-        elif not is_intentional_clear:
-            # Only log a warning if the draft state is empty unintentionally
-            logger.warning("Draft state is empty. Skipping Draft State update.")
-    
+                draft_values.append(["", "", ""])
+        
+        if draft_values:
+            batch_data.append({
+                'range': f'A3:C{max_rows+2}',
+                'values': draft_values
+            })
+
+        # Skips data (E3:F{max_rows+2})
+        skips_values = []
+        for i in range(max_rows):
+            if i < len(skips_data):
+                skips_values.append(skips_data[i])
+            else:
+                skips_values.append(["", ""])
+        
+        if skips_values:
+            batch_data.append({
+                'range': f'E3:F{max_rows+2}',
+                'values': skips_values
+            })
+
+        # Execute batch update
+        pokemon_sheet.batch_update(batch_data)
+        logger.info("Updated sheet with combined data.")
+
     except Exception as e:
         logger.error(f"Error updating Google Sheet: {e}")
         raise
@@ -1063,9 +1086,6 @@ def process_pick(user: discord.Member, pokemon_name: str, pokemon_info: dict) ->
     else:
         logger.info(f"No remaining time to clear for {user.name}.")
     
-    # Update the Google Sheet
-    update_google_sheet()
-    
     return draft_state["teams"][user]["points"]
  
 # Function to start the draft (updated in v0.50)
@@ -1081,21 +1101,17 @@ async def start_draft(interaction: discord.Interaction, participants: list[disco
         draft_state["skipped_turns"] = {member: 0 for member in participants}
         draft_state["draft_channel_id"] = interaction.channel.id
 
-        # Update the Google Sheet
-        try:
-            update_google_sheet()
-        except Exception as e:
-            logger.error(f"Error updating Google Sheet: {e}")
-            await interaction.followup.send(
-                "⚠️ The draft was started, but there was an error updating the Google Sheet. "
-                "Please check the logs for details.",
-                ephemeral=True
-            )
-
         # Send the draft start message
         await interaction.followup.send(
             "Draft started! \n\nThe order is:\n" + "\n".join([member.mention for member in draft_state["participants"]]) + "\n in snake format"
         )
+
+        # Update Google Sheet to reflect the new skip count
+        try:
+            update_google_sheet()
+            logger.info(f"Updated Google Sheet after starting a new draft")
+        except Exception as e:
+            logger.error(f"Failed to update Google Sheet after starting a new draft")
 
         # Notify the first participant and start the timer
         await notify_current_participant(interaction)
@@ -1186,6 +1202,12 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
     # Increment the skipped turns counter for the participant
     if participant in draft_state["skipped_turns"]:
         draft_state["skipped_turns"][participant] += 1
+        # Update Google Sheet to reflect the new skip count
+        try:
+            update_google_sheet()
+            logger.info(f"Updated Google Sheet after {participant.name} timed out")
+        except Exception as e:
+            logger.error(f"Failed to update Google Sheet after timeout: {e}")
     else:
         draft_state["skipped_turns"][participant] = 1
 
@@ -1759,15 +1781,6 @@ async def stop_draft_command(interaction: discord.Interaction):
             "auto_extensions": {},
             "draft_phase": "setup"  # Add this line
         }
-        
-        # Update Google Sheets
-        try:
-            update_google_sheet(is_intentional_clear=True)
-            logger.info(f"{interaction.user.name} updated Google Sheet after stopping draft")
-            sheet_message = ""
-        except Exception as e:
-            logger.error(f"{interaction.user.name} failed to update Google Sheet after stop: {str(e)}")
-            sheet_message = "\n⚠️ Failed to update Google Sheet"
 
         # Send success message
         success_message = (
@@ -1776,7 +1789,6 @@ async def stop_draft_command(interaction: discord.Interaction):
             "• All draft data has been cleared\n"
             "• The bot is ready for a new draft"
             f"{save_message}"
-            f"{sheet_message}"
         )
         await interaction.followup.send(success_message, ephemeral=True)
         
@@ -2026,6 +2038,12 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
             logger.info(f"Resetting skipped_turns counter for {user.name}")
             draft_state["skipped_turns"][user] = 0
     
+    try:
+        update_google_sheet()
+        logger.info(f"Updated Google Sheet after succesful pick")
+    except Exception as e:
+        logger.error(f"Failed to update Google Sheet after succesful pick")
+
     # --- 7. Send announcement ---
     embed = create_pick_announcement_embed(user, pokemon_name, pokemon_info)
     await interaction.followup.send(embed=embed)
