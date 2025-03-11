@@ -19,7 +19,7 @@ class DraftState:
     is_paused: bool
     auto_extensions: dict
     remaining_times: dict
-    selected_coaches: list
+    draft_phase: str
     timestamp: str
 
 class StateManager:
@@ -57,7 +57,7 @@ class StateManager:
             self.logger.error(f"Error deserializing member: {e}")
             return None
 
-    def save_state(self, draft_state: dict, selected_coaches: list, remaining_times: dict, 
+    def save_state(self, draft_state: dict, remaining_times: dict, 
                 filename: Optional[str] = None) -> str:
         """Save the current draft state to a file"""
         try:
@@ -69,10 +69,8 @@ class StateManager:
                 'order': [self._serialize_member(m) for m in draft_state['order']],
                 'current_pick': draft_state['current_pick'],
                 'teams': {
-                    str(member.id): {
-                        'pokemon': data['pokemon'],
-                        'points': data['points']
-                    } for member, data in draft_state['teams'].items()
+                    str(member.id): data 
+                    for member, data in draft_state['teams'].items()
                 },
                 'available_pokemon': draft_state['available_pokemon'],
                 'skipped_turns': {
@@ -92,7 +90,7 @@ class StateManager:
                     str(member.id): time 
                     for member, time in remaining_times.items()
                 },
-                'selected_coaches': [self._serialize_member(m) for m in selected_coaches],
+                'draft_phase': draft_state['draft_phase'],  # Add this line
                 'timestamp': datetime.now().isoformat()
             }
 
@@ -112,7 +110,7 @@ class StateManager:
             self.logger.error(f"Error saving draft state: {e}")
             raise
 
-    def load_state(self, filename: str, guild: discord.Guild) -> tuple[dict, list, dict]:
+    def load_state(self, filename: str, guild: discord.Guild) -> tuple[dict, dict]:
         """Load a draft state from a file"""
         try:
             if not guild:
@@ -161,7 +159,8 @@ class StateManager:
                     for member_id, count in saved_state['auto_extensions'].items()
                     if (member := safe_deserialize({'id': int(member_id)})) is not None
                 },
-                'draft_channel_id': saved_state.get('draft_channel_id')  
+                'draft_channel_id': saved_state.get('draft_channel_id'),
+                'draft_phase': saved_state.get('draft_phase', 'setup')
             }
 
             remaining_times = {
@@ -170,15 +169,12 @@ class StateManager:
                 if (member := safe_deserialize({'id': int(member_id)})) is not None
             }
 
-            selected_coaches = [
-                m for m in (safe_deserialize(m) for m in saved_state['selected_coaches']) if m is not None
-            ]
             # Add these logs
             self.logger.info(f"Loaded remaining_times from file: {saved_state.get('remaining_times', {})}")
             self.logger.info(f"Deserialized remaining_times: {remaining_times}")
             self.logger.info(f"Draft state loaded from {filepath}")
-            self.logger.info(f"Loaded {len(selected_coaches)} coaches, {len(draft_state['participants'])} participants")
-            return draft_state, selected_coaches, remaining_times
+            self.logger.info(f"Loaded {len(draft_state['participants'])} participants")
+            return draft_state, remaining_times
 
         except Exception as e:
             self.logger.error(f"Error loading draft state: {e}")
