@@ -1,20 +1,13 @@
 '''
-v0.54 - Added proper logging -OK
-v0.54.1 -Re-aranged pieces of code (func w/ func, scommands w/ scommands, etc.)
-
-v0.55 - removing /numberofcoaches and recoding /set_coaches - also removed fetch guild members at start
-
-v0.56 - adding security for Google Creds
-
 v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway there
 
-   0.57.1 Timers look like are restored ok now and draft state as well. A few things to check like 
-   0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
-   0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
-   0.57.4 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -PENDING
-    also need to check the ephemeral marked embeds that are not being ephemeral (skip)
-    Lastly check why the commands in draft_state_commands.py arent showing and see which are useful
-    an option to load and not just auto-load the latest .json looks like a good option
+    0.57.1 Timers look like are restored ok now and draft state as well. A few things to check like 
+    0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
+    0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
+    0.58 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -OK
+    0.58.1 also need to check the ephemeral marked embeds that are not being ephemeral (skip) - PENDING
+    0.59 Lastly check why the commands in draft_state_commands.py arent showing and see which are useful - PENDING
+    0.60 an option to load and not just auto-load the latest .json looks like a good option and handle the .json files - PENDING
 
 Once finished, new version should be v0.6
 '''
@@ -45,6 +38,7 @@ from draft_state_commands import DraftStateCommands
 import signal
 import sys
 import time
+import random
 
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
@@ -398,113 +392,123 @@ pokemon_names = list(pokemon_data.keys())
 
 #Function to Update Google Sheets
 def update_google_sheet(is_intentional_clear=False):
-    try:
-        # Get cached clients
-        client = google_services.get_sheets_client()
-        drive_service = google_services.get_drive_service()
-        
-        if not client or not drive_service:
-            raise Exception("Failed to get Google services")
-        
-        # Define the folder ID and sheet name
-        folder_id = "13B6DevETQRkLON7yuonkpAHiar0NwwyU"  # Replace with your folder ID
-        sheet_name = "Draft Sheet"  # Replace with your sheet name
-        
-        # List files in the folder
-        query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
-        response = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        files = response.get("files", [])
-        
-        # Find the sheet by name
-        sheet_id = None
-        for file in files:
-            if file["name"] == sheet_name:
-                sheet_id = file["id"]
-                break
-        
-        if not sheet_id:
-            raise Exception(f"Could not find Google Sheet with name '{sheet_name}' in folder '{folder_id}'.")
-        
-        # Open the Google Sheet by ID
-        spreadsheet = client.open_by_key(sheet_id)
-        
-       # Clear the sheet
-        pokemon_sheet = spreadsheet.sheet1
-        pokemon_sheet.clear()
-        logger.info("Cleared sheet.")
+    max_retries = 5
+    backoff_time = 1  # Start with 1 second
+    for attempt in range(max_retries):
+        try:
+            # Get cached clients
+            client = google_services.get_sheets_client()
+            drive_service = google_services.get_drive_service()
+            
+            if not client or not drive_service:
+                raise Exception("Failed to get Google services")
+            
+            # Define the folder ID and sheet name
+            folder_id = "13B6DevETQRkLON7yuonkpAHiar0NwwyU"  # Replace with your folder ID
+            sheet_name = "Draft Sheet"  # Replace with your sheet name
+            
+            # List files in the folder
+            query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
+            response = drive_service.files().list(q=query, fields="files(id, name)").execute()
+            files = response.get("files", [])
+            
+            # Find the sheet by name
+            sheet_id = None
+            for file in files:
+                if file["name"] == sheet_name:
+                    sheet_id = file["id"]
+                    break
+            
+            if not sheet_id:
+                raise Exception(f"Could not find Google Sheet with name '{sheet_name}' in folder '{folder_id}'.")
+            
+            # Open the Google Sheet by ID
+            spreadsheet = client.open_by_key(sheet_id)
+            
+            # Clear the sheet
+            pokemon_sheet = spreadsheet.sheet1
+            pokemon_sheet.clear()
+            logger.info("Cleared sheet.")
 
-        # We'll use batch_update to set specific ranges
-        batch_data = []
+            # We'll use batch_update to set specific ranges
+            batch_data = []
 
-        # First row - section headers
-        batch_data.append({
-            'range': 'A1:E1',
-            'values': [["Draft Status", "", "", "", "Skips Tracking"]]
-        })
+            # First row - section headers
+            batch_data.append({
+                'range': 'A1:E1',
+                'values': [["Draft Status", "", "", "", "Skips Tracking"]]
+            })
 
-        # Second row - column headers
-        batch_data.append({
-            'range': 'A2:F2',
-            'values': [["Coach", "Pokemon", "Points", "", "Coach", "Skips"]]
-        })
+            # Second row - column headers
+            batch_data.append({
+                'range': 'A2:F2',
+                'values': [["Coach", "Pokemon", "Points", "", "Coach", "Skips"]]
+            })
 
-        # Prepare data arrays
-        picks_data = []
-        if draft_state.get("teams"):
-            for coach, team in draft_state["teams"].items():
-                for pokemon in team["pokemon"]:
-                    picks_data.append([
-                        coach.display_name,
-                        pokemon,
-                        pokemon_data[pokemon]["points"]
+            # Prepare data arrays
+            picks_data = []
+            if draft_state.get("teams"):
+                for coach, team in draft_state["teams"].items():
+                    for pokemon in team["pokemon"]:
+                        picks_data.append([
+                            coach.display_name,
+                            pokemon,
+                            pokemon_data[pokemon]["points"]
+                        ])
+
+            skips_data = []
+            if draft_state.get("participants"):
+                for participant in draft_state["participants"]:
+                    skips_data.append([
+                        participant.display_name,
+                        draft_state["skipped_turns"].get(participant, 0)
                     ])
 
-        skips_data = []
-        if draft_state.get("participants"):
-            for participant in draft_state["participants"]:
-                skips_data.append([
-                    participant.display_name,
-                    draft_state["skipped_turns"].get(participant, 0)
-                ])
+            # Combine data with specific range assignments
+            max_rows = max(len(picks_data), len(skips_data))
+            
+            # Draft data (A3:C{max_rows+2})
+            draft_values = []
+            for i in range(max_rows):
+                if i < len(picks_data):
+                    draft_values.append(picks_data[i])
+                else:
+                    draft_values.append(["", "", ""])
+            
+            if draft_values:
+                batch_data.append({
+                    'range': f'A3:C{max_rows+2}',
+                    'values': draft_values
+                })
 
-        # Combine data with specific range assignments
-        max_rows = max(len(picks_data), len(skips_data))
-        
-        # Draft data (A3:C{max_rows+2})
-        draft_values = []
-        for i in range(max_rows):
-            if i < len(picks_data):
-                draft_values.append(picks_data[i])
+            # Skips data (E3:F{max_rows+2})
+            skips_values = []
+            for i in range(max_rows):
+                if i < len(skips_data):
+                    skips_values.append(skips_data[i])
+                else:
+                    skips_values.append(["", ""])
+            
+            if skips_values:
+                batch_data.append({
+                    'range': f'E3:F{max_rows+2}',
+                    'values': skips_values
+                })
+
+            # Execute batch update
+            pokemon_sheet.batch_update(batch_data)
+            logger.info("Updated sheet with combined data.")
+            return
+
+        except Exception as e:
+            logger.error(f"Error updating Google Sheet: {e}")
+            if attempt < max_retries - 1:
+                sleep_time = backoff_time + random.uniform(0, 1)  # Add jitter to prevent thundering herd
+                logger.info(f"Retrying in {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+                backoff_time *= 2  # Exponential backoff
             else:
-                draft_values.append(["", "", ""])
-        
-        if draft_values:
-            batch_data.append({
-                'range': f'A3:C{max_rows+2}',
-                'values': draft_values
-            })
-
-        # Skips data (E3:F{max_rows+2})
-        skips_values = []
-        for i in range(max_rows):
-            if i < len(skips_data):
-                skips_values.append(skips_data[i])
-            else:
-                skips_values.append(["", ""])
-        
-        if skips_values:
-            batch_data.append({
-                'range': f'E3:F{max_rows+2}',
-                'values': skips_values
-            })
-
-        # Execute batch update
-        pokemon_sheet.batch_update(batch_data)
-        logger.info("Updated sheet with combined data.")
-
-    except Exception as e:
-        logger.error(f"Error updating Google Sheet: {e}")
-        raise
+                raise
 
 # Draft state
 draft_state = {
@@ -583,7 +587,7 @@ if not os.path.exists('draft_states'):
 # Initialize state manager
 state_manager = StateManager()
 
-#Autosaver
+# Autosaver
 class AutoSaver:
     def __init__(self, state_manager, save_interval=30):
         self.state_manager = state_manager
@@ -626,10 +630,10 @@ class AutoSaver:
                 logger.info(f"Has participants: {bool(draft_state.get('participants'))}")
                 logger.info(f"Has current_pick: {'current_pick' in draft_state}")
                 logger.info(f"Has order: {'order' in draft_state}")
-                
+
                 order_length = len(draft_state.get("order", []))
                 logger.info(f"Order length: {order_length}")
-                
+
                 if "current_pick" in draft_state:
                     if order_length > 0:
                         adjusted_pick = draft_state['current_pick'] % order_length
@@ -2158,6 +2162,14 @@ async def pause_draft_command(interaction: discord.Interaction):
     logger.info(f"User {interaction.user.name} successfully paused draft - {current_user.name} was in turn")
     await interaction.response.send_message(f"The draft has been paused. {current_user.mention} was in turn.")
 
+    # Stop auto-saver and save state once
+    await auto_saver.stop()
+    try:
+        filename = state_manager.save_state(draft_state, remaining_times)
+        logger.info(f"Draft state saved to {filename} upon pausing")
+    except Exception as e:
+        logger.error(f"Failed to save draft state upon pausing: {e}")
+
 #Slash Command to resume the draft
 @bot.tree.command(name="resume_draft", description="Resume the paused draft", guild=GUILD_ID)
 @has_draft_staff_role()
@@ -2188,6 +2200,9 @@ async def resume_draft_command(interaction: discord.Interaction):
 
     logger.info(f"User {interaction.user.name} successfully resumed draft - {current_user.name} has {remaining_time} seconds remaining")
     await interaction.response.send_message(f"The draft has been resumed. {current_user.mention}, you have {format_time(remaining_time)} remaining.")
+
+    # Restart auto-saver
+    await auto_saver.start()
 
 # Slash command to check current draft
 @bot.tree.command(name="my_draft", description="View your current draft", guild=GUILD_ID)
