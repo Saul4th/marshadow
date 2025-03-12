@@ -5,7 +5,7 @@ v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway
     0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
     0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
     0.58 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -OK
-    0.58.1 also need to check the ephemeral marked embeds that are not being ephemeral (skip) - PENDING
+    0.58.1 also need to check the ephemeral marked embeds that are not being ephemeral (skip) - ok
     0.59 Lastly check why the commands in draft_state_commands.py arent showing and see which are useful - PENDING
     0.60 an option to load and not just auto-load the latest .json looks like a good option and handle the .json files - PENDING
 
@@ -1614,21 +1614,22 @@ async def start_draft_command(interaction: discord.Interaction):
     global draft_state
     logger.info(f"{interaction.user.name} attempting to start draft")
 
-    # Defer the response immediately to prevent interaction timeout
-    await interaction.response.defer()
-   
+    # Check conditions without deferring first
     # Check if a draft is already in progress
     if draft_state["draft_phase"] != "setup":
         logger.error(f"{interaction.user.name} failed to start draft - Draft already in progress")
-        await interaction.followup.send("A draft is already in progress. Please wait until the current draft finishes before starting a new one.", ephemeral=True)
+        await interaction.response.send_message("A draft is already in progress. Please wait until the current draft finishes before starting a new one.", ephemeral=True)
         return
     
     # Check if coaches have been set
     if not draft_state['participants']:
         logger.error(f"{interaction.user.name} failed to start draft - No coaches set")
-        await interaction.followup.send("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
+        await interaction.response.send_message("No coaches have been set. Use `/set_coaches` first.", ephemeral=True)
         return
 
+    # If we get here, we're good to start the draft, so NOW defer without ephemeral
+    await interaction.response.defer()
+    
     try:
         # Start the draft with the set coaches
         draft_state['draft_phase'] = 'active'
@@ -1637,11 +1638,11 @@ async def start_draft_command(interaction: discord.Interaction):
         logger.info(f"{interaction.user.name} successfully started draft with coaches: {', '.join(coach_names)}")
     except Exception as e:
         logger.error(f"{interaction.user.name} failed to start draft - Error: {str(e)}")
+        # Since we've deferred without ephemeral, this error will be public,
+        # but it's a rare case that happens during the start_draft process
         await interaction.followup.send(
-            "An error occurred while starting the draft. Please try again or contact the administrator.",
-            ephemeral=True
+            "An error occurred while starting the draft. Please try again or contact the administrator."
         )
-
 #Slash command to stop the draft - NEW TO HANDLE STATE
 @bot.tree.command(
     name="stop_draft", 
@@ -1820,7 +1821,7 @@ async def stop_draft_command(interaction: discord.Interaction):
 @has_draft_staff_role()
 async def skip_command(interaction: discord.Interaction):
     logger.info(f"User {interaction.user.name} attempting to skip turn")
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     # Get the current participant that will be skipped
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
