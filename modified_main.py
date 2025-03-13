@@ -734,10 +734,6 @@ async def on_ready():
         logger.error("Failed to initialize Google services. Bot may not function correctly.")
         return
     
-    # Add the cog...
-    if 'DraftStateCommands' not in [c.__class__.__name__ for c in bot.cogs.values()]:
-        await bot.add_cog(DraftStateCommands(bot, state_manager, draft_state, GUILD_ID))
-    
     # Wait for guild cache to be ready - use GUILD_ID_RAW here
     guild = None
     retries = 0
