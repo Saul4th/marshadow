@@ -4,10 +4,12 @@ v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway
     0.57.1 Timers look like are restored ok now and draft state as well. A few things to check like 
     0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
     0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
-    0.58 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -OK
+0.58 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -OK
     0.58.1 also need to check the ephemeral marked embeds that are not being ephemeral (skip) - ok
-    0.59 Lastly check why the commands in draft_state_commands.py arent showing and see which are useful - PENDING
-    0.60 an option to load and not just auto-load the latest .json looks like a good option and handle the .json files - PENDING
+0.59 Lastly check why the commands in draft_state_commands.py arent showing and see which are useful - resolved
+    0.59.1 Got rid of the draft_state_commands.py - I'll add management state commands directly in main (ok)
+0.60 an option to load and not just auto-load the latest .json looks like a good option and handle the .json files - OK
+    0.60.1 bot now only creates 15 .json files max and delete oldest after reaching the limit -OK 
 
 Once finished, new version should be v0.6
 '''
@@ -34,12 +36,12 @@ import secrets                          # For generating cryptographically stron
 from typing import Optional             # For type hinting functions that might return None (like get_sheets_client)
 '''v0.57'''
 from state_manager import StateManager
-from draft_state_commands import DraftStateCommands
 import signal
 import sys
 import time
 import random
-
+import json
+from typing import List
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
 '''GLOBAL VARIABLES'''
@@ -71,6 +73,15 @@ participant_timers = {}
 
 # Global variable to track remaining time for each participant
 remaining_times = {}
+
+# Store your Discord ID in a constant at the top of the file for easy reference
+PRIORITY_STAFF_ID = 361021962585112576  # Your Discord ID
+
+# In the global scope, add a variable to track which staff members have been contacted
+staff_notification_attempts = {}
+
+# Global variable to track pending draft state
+pending_draft_state = None
 
 '''INITIALIZE'''
 # Configure logging
@@ -720,7 +731,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 # Modify your on_ready event
 @bot.event
 async def on_ready():
-    global draft_state, remaining_times, participant_timers
+    global draft_state, remaining_times, participant_timers, pending_draft_state
     
     logger.info(f'Logged in as {bot.user}')
     
@@ -750,25 +761,229 @@ async def on_ready():
     if not guild:
         logger.error("Failed to get guild after maximum retries")
         return
-        
+    
     # Start auto-saver
     await auto_saver.start()
     
-    # Check for auto-recovery state
+    # Check for save states - MODIFIED SECTION
     try:
         recovery_states = state_manager.list_saved_states()
         if recovery_states:
             latest_state = recovery_states[0][0]
-            logger.info(f"Found recovery state: {latest_state}")
+            logger.info(f"Found saved draft state: {latest_state}")
             
+            # First, let's load the save data to get the channel ID without actually applying the state
+            try:
+                with open(os.path.join(state_manager.save_directory, latest_state), 'r') as f:
+                    saved_data = json.load(f)
+                    
+                original_channel_id = saved_data.get('draft_channel_id')
+                if not original_channel_id:
+                    logger.warning("No draft_channel_id found in saved state")
+                    return
+                
+                # Fetch the original channel
+                original_channel = guild.get_channel(original_channel_id)
+                if not original_channel:
+                    logger.error(f"Cannot find original draft channel (ID: {original_channel_id})")
+                    return
+                
+                # Find staff members with "Draft Staff" role to notify
+                staff_role = discord.utils.get(guild.roles, name="Draft Staff")
+                staff_members = []
+                
+                if staff_role:
+                    staff_members = [member for member in guild.members if staff_role in member.roles]
+                    
+                # Find the target staff member - prioritize you first
+                target_staff = None
+                
+                # Look for you first by Discord ID
+                for member in guild.members:
+                    if member.id == PRIORITY_STAFF_ID and staff_role in member.roles:
+                        target_staff = member
+                        break
+                
+                # If you weren't found or don't have the role, fall back to other staff
+                if not target_staff and staff_members:
+                    # Prioritize staff members who are online
+                    online_staff = [m for m in staff_members if m.status != discord.Status.offline]
+                    target_staff = online_staff[0] if online_staff else staff_members[0]
+                    
+                # Create embed for the saved state
+                saved_time = datetime.fromisoformat(recovery_states[0][1])
+                formatted_time = saved_time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                embed = discord.Embed(
+                    title="🔄 Draft Save State Found",
+                    description="A previous draft state was found. Would you like to restore it?",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(
+                    name="Save Information",
+                    value=f"• Filename: `{latest_state}`\n• Saved: {formatted_time}"
+                )
+                embed.set_footer(text="Use the buttons below to load or ignore this saved state")
+                
+                # Create view with load/ignore buttons
+                view = SaveStatePromptView(state_manager, guild, latest_state, original_channel_id)
+                
+                # Initialize tracking for this file
+                if latest_state not in staff_notification_attempts:
+                    staff_notification_attempts[latest_state] = []
+                
+                if target_staff:
+                    try:
+                        # Send private DM with actionable buttons
+                        dm_channel = await target_staff.create_dm()
+                        view = SaveStatePromptView(state_manager, guild, latest_state, original_channel_id, target_staff)
+                        message = await dm_channel.send(
+                            f"📢 A saved draft state was found in {original_channel.mention}.\n"
+                            f"Please decide whether to restore this draft state:",
+                            embed=embed,
+                            view=view
+                        )
+                        
+                        # Store the message ID for future reference
+                        view.message = message
+                        logger.info(f"Sent save state prompt to {target_staff.name} via DM")
+                        
+                        # Record that this staff member was contacted
+                        staff_notification_attempts[latest_state].append(target_staff.id)
+                        
+                        # Send notification to other staff members (without buttons)
+                        for staff_member in staff_members:
+                            if staff_member != target_staff:
+                                try:
+                                    dm_channel = await staff_member.create_dm()
+                                    info_embed = discord.Embed(
+                                        title="🔄 Draft Save State Found",
+                                        description=f"A previous draft state was found. {target_staff.mention} has been notified to handle the restoration.",
+                                        color=discord.Color.blue()
+                                    )
+                                    await dm_channel.send(embed=info_embed)
+                                    logger.info(f"Sent notification to {staff_member.name} via DM")
+                                except:
+                                    logger.info(f"Could not send DM to {staff_member.name}")
+                    except:
+                        logger.error(f"Could not send DM to {target_staff.name}, trying another staff member")
+
+                        # Add this staff member to the list of attempts
+                        staff_notification_attempts[latest_state].append(target_staff.id)
+                        
+                        # Try another staff member
+                        remaining_staff = [m for m in staff_members if m.id != target_staff.id]
+                        if remaining_staff:
+                            new_target = remaining_staff[0]
+                            try:
+                                dm_channel = await new_target.create_dm()
+                                view = SaveStatePromptView(state_manager, guild, latest_state, original_channel_id, new_target)
+                                message = await dm_channel.send(
+                                    f"📢 A saved draft state was found in {original_channel.mention}.\n"
+                                    f"Please decide whether to restore this draft state:",
+                                    embed=embed,
+                                    view=view
+                                )
+                                view.message = message
+                                staff_notification_attempts[latest_state].append(new_target.id)
+                                logger.info(f"Sent save state prompt to {new_target.name} via DM (fallback)")
+                            except:
+                                logger.error(f"Could not send DM to fallback staff member {new_target.name}")
+                                pending_draft_state = {
+                                    'filename': latest_state,
+                                    'channel_id': original_channel_id,
+                                    'timestamp': formatted_time
+                                }
+                        else:
+                            logger.warning("No other staff members available to notify")
+                            pending_draft_state = {
+                                'filename': latest_state,
+                                'channel_id': original_channel_id,
+                                'timestamp': formatted_time
+                            }
+                else:
+                    logger.warning("No Draft Staff members found to notify about saved state")
+                    pending_draft_state = {
+                        'filename': latest_state,
+                        'channel_id': original_channel_id,
+                        'timestamp': formatted_time
+                    }
+                
+            except Exception as e:
+                logger.error(f"Error reading saved state: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error checking for saved draft states: {e}")
+        logger.exception("Full error details:")
+    
+    try:
+        # Use original GUILD_ID (discord.Object) for command syncing
+        synced = await bot.tree.sync(guild=GUILD_ID)
+        logger.info(f'Synced {len(synced)} commands to guild {GUILD_ID.id}')
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
+
+# Create the button view for the save state prompt
+class SaveStatePromptView(discord.ui.View):
+    def __init__(self, state_manager, guild, filename, original_channel_id, staff_member=None):
+        super().__init__(timeout=300)  # 5 minute timeout (300 seconds)
+        self.state_manager = state_manager
+        self.guild = guild
+        self.filename = filename
+        self.original_channel_id = original_channel_id
+        self.message = None
+        self.staff_member = staff_member  # Store which staff member this was sent to
+    
+    @discord.ui.button(label="Load Save State", style=discord.ButtonStyle.primary, custom_id="load_state")
+    async def load_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # First check if we're in a DM channel - if so, we need a different approach
+        if isinstance(interaction.channel, discord.DMChannel):
+            # This is a DM, so we need to get the original channel
+            original_channel = self.guild.get_channel(self.original_channel_id)
+            if not original_channel:
+                await interaction.response.send_message(
+                    "Error: Could not find the original draft channel.",
+                    ephemeral=True
+                )
+                return
+            
+            await interaction.response.send_message(
+                f"Loading saved draft state... I'll send you an update when it's done."
+            )
+        else:
+            # We're in a guild channel, use ephemeral response
+            await interaction.response.defer(ephemeral=True)
+            
+            # Verify we're in the original channel
+            if interaction.channel_id != self.original_channel_id:
+                await interaction.followup.send(
+                    "Error: Draft can only be resumed in the original channel where it was running.",
+                    ephemeral=True
+                )
+                return
+            
+            await interaction.followup.send(
+                "Loading saved draft state... Please wait.",
+                ephemeral=True
+            )
+            
+            original_channel = interaction.channel
+        
+        try:
             # Load the state
-            loaded_state, loaded_times = state_manager.load_state(
-                latest_state,
-                guild
+            loaded_state, loaded_times = self.state_manager.load_state(
+                self.filename,
+                self.guild
             )
             
             if not loaded_state['participants']:
-                logger.warning("No participants found in loaded state")
+                if isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.channel.send("⚠️ Error: No participants found in loaded state")
+                else:
+                    await interaction.followup.send(
+                        "⚠️ Error: No participants found in loaded state",
+                        ephemeral=True
+                    )
                 return
                 
             # Update global state
@@ -783,9 +998,23 @@ async def on_ready():
                 logger.info("Draft was paused, restoring remaining times without starting timers")
                 remaining_times.update(loaded_times)
                 logger.info(f"Restored remaining times for {len(remaining_times)} participants")
+                
+                success_message = (
+                    f"✅ Draft state loaded successfully from `{self.filename}`!\n"
+                    f"• Draft is currently **paused**\n"
+                    f"• {len(draft_state['participants'])} participants restored\n"
+                    f"• Use `/resume_draft` to continue"
+                )
+                
+                if isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.channel.send(success_message)
+                else:
+                    await interaction.followup.send(success_message, ephemeral=True)
+                
+                # No public announcement for paused state restoration as requested
             else:
                 logger.info("Draft was active, restoring timers")
-                current_participant = draft_state['order'][draft_state['current_pick']]
+                current_participant = draft_state['order'][draft_state['current_pick'] % len(draft_state['order'])]
                 if current_participant:
                     logger.info(f"Current participant: {current_participant.name}")
                     logger.info(f"Loaded remaining times: {loaded_times}")
@@ -796,15 +1025,12 @@ async def on_ready():
                     if remaining_time and remaining_time > 0:
                         logger.info(f"Restarting timer for {current_participant.name} with {remaining_time} seconds remaining")
                         try:
-                            # Get the channel
-                            channel = None
-                            if 'draft_channel_id' in draft_state:
-                                channel = guild.get_channel(draft_state['draft_channel_id'])
+                            # THIS IS THE ONLY PUBLIC MESSAGE - visible to everyone
+                            initial_message = await original_channel.send(
+                                f":arrow_forward: Draft state restored! Continuing from where we left off.\n"
+                                f"It's {current_participant.mention}'s turn."
+                            )
                             
-                            if not channel:
-                                logger.error("Could not find original draft channel")
-                                return
-
                             class MinimalInteraction:
                                 def __init__(self, channel, initial_message=None):
                                     self.channel = channel
@@ -817,14 +1043,8 @@ async def on_ready():
                                         return self._initial_message
                                     else:
                                         return await self._initial_message.reply(*args, **kwargs)
-
-                            # Send restoration message and store it as the initial message
-                            initial_message = await channel.send(
-                                f":arrow_forward: Draft state restored! Continuing from where we left off.\n"
-                                f"It's {current_participant.mention}'s turn."
-                            )
                             
-                            mock_interaction = MinimalInteraction(channel, initial_message)
+                            mock_interaction = MinimalInteraction(original_channel, initial_message)
                             
                             # Update Google Sheet with current state
                             try:
@@ -841,31 +1061,200 @@ async def on_ready():
                             remaining_times[current_participant] = remaining_time
                             logger.info(f"Successfully restored timer for {current_participant.name}")
                             
+                            success_message = (
+                                f"✅ Draft state loaded successfully from `{self.filename}`!\n"
+                                f"• Draft is now **active**\n"
+                                f"• {len(draft_state['participants'])} participants restored\n"
+                                f"• Current turn: {current_participant.mention}"
+                            )
+                            
+                            if isinstance(interaction.channel, discord.DMChannel):
+                                await interaction.channel.send(success_message)
+                            else:
+                                await interaction.followup.send(success_message, ephemeral=True)
+                            
                         except Exception as e:
                             logger.error(f"Failed to restore timer for {current_participant.name}: {e}")
+                            error_msg = f"⚠️ Draft state was loaded but there was an error restoring timers: {str(e)}"
+                            
+                            if isinstance(interaction.channel, discord.DMChannel):
+                                await interaction.channel.send(error_msg)
+                            else:
+                                await interaction.followup.send(error_msg, ephemeral=True)
                     else:
-                        logger.warning(f"No valid remaining time found for {current_participant.name} in loaded_times")
+                        logger.warning(f"No valid remaining time found for {current_participant.name}")
+                        error_msg = f"⚠️ Draft state was loaded but no valid timer was found for {current_participant.mention}"
                         
-            logger.info(f"Successfully recovered draft state with {len(draft_state['participants'])} coaches")
+                        if isinstance(interaction.channel, discord.DMChannel):
+                            await interaction.channel.send(error_msg)
+                        else:
+                            await interaction.followup.send(error_msg, ephemeral=True)
             
-            # Log the current draft state
-            logger.info(f"Current pick: {draft_state['current_pick']}")
-            if draft_state['order']:
-                current_drafter = draft_state['order'][draft_state['current_pick']]
-                logger.info(f"Current drafter: {current_drafter.name if current_drafter else 'None'}")
-            logger.info(f"Draft phase: {draft_state.get('draft_phase', 'setup')}")
-            logger.info(f"Draft is {'paused' if draft_state['is_paused'] else 'active'}")
+            # Disable the buttons after load
+            for child in self.children:
+                child.disabled = True
+                
+            if self.message:
+                try:
+                    await self.message.edit(view=self)
+                except:
+                    logger.warning("Could not edit message with disabled buttons")
             
-    except Exception as e:
-        logger.error(f"Failed to recover draft state: {e}")
-        logger.exception("Full error details:")
+            # Clear the pending state
+            pending_draft_state = None
+            
+        except Exception as e:
+            logger.error(f"Failed to load draft state: {e}")
+            error_msg = f"❌ Error loading draft state: {str(e)}"
+            
+            if isinstance(interaction.channel, discord.DMChannel):
+                await interaction.channel.send(error_msg)
+            else:
+                await interaction.followup.send(error_msg, ephemeral=True)
+    @discord.ui.button(label="Ignore Save", style=discord.ButtonStyle.secondary, custom_id="ignore_state")
+    async def ignore_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if isinstance(interaction.channel, discord.DMChannel):
+            await interaction.response.send_message("✅ Ignoring saved draft state. Starting fresh session.")
+        else:
+            await interaction.response.defer(ephemeral=True)
+            # Verify we're in the original channel
+            if interaction.channel_id != self.original_channel_id:
+                await interaction.followup.send(
+                    "Error: Draft can only be managed in the original channel where it was running.",
+                    ephemeral=True
+                )
+                return
+            
+            await interaction.followup.send(
+                "✅ Ignoring saved draft state. Starting fresh session.",
+                ephemeral=True
+            )
+        
+        # Disable the buttons
+        for child in self.children:
+            child.disabled = True
+            
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except:
+                logger.warning("Could not edit message with disabled buttons")
+        
+        # Clear the pending state
+        pending_draft_state = None
+        
+        logger.info(f"User {interaction.user.display_name} chose to ignore saved state {self.filename}")
     
-    try:
-        # Use original GUILD_ID (discord.Object) for command syncing
-        synced = await bot.tree.sync(guild=GUILD_ID)
-        logger.info(f'Synced {len(synced)} commands to guild {GUILD_ID.id}')
-    except Exception as e:
-        logger.error(f"Error syncing commands: {e}")
+    async def on_timeout(self):
+        global staff_notification_attempts
+        
+        # Disable the buttons when the view times out
+        for child in self.children:
+            child.disabled = True
+            
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=f"⏰ This prompt has timed out and is no longer active.",
+                    view=self
+                )
+            except:
+                logger.warning("Could not edit message with disabled buttons after timeout")
+        
+        # Try to notify another staff member if this one didn't respond
+        if self.staff_member:
+            # Record this timeout
+            if self.filename not in staff_notification_attempts:
+                staff_notification_attempts[self.filename] = []
+            staff_notification_attempts[self.filename].append(self.staff_member.id)
+            
+            # Try to find another staff member to notify
+            try:
+                staff_role = discord.utils.get(self.guild.roles, name="Draft Staff")
+                if staff_role:
+                    # Get all staff members who haven't been contacted yet about this file
+                    staff_members = [
+                        member for member in self.guild.members 
+                        if staff_role in member.roles and 
+                        (self.filename not in staff_notification_attempts or 
+                         member.id not in staff_notification_attempts[self.filename])
+                    ]
+                    
+                    if not staff_members:
+                        # No more staff members to contact - default to not loading the state
+                        logger.info(f"All staff members have been contacted about {self.filename}. Defaulting to not load.")
+                        
+                        # Clean up our tracking for this file
+                        if self.filename in staff_notification_attempts:
+                            del staff_notification_attempts[self.filename]
+                            
+                        return
+                    
+                    # Find the target staff member - prioritize you first, then online staff
+                    target_staff = None
+                    
+                    # Look for you first by Discord ID
+                    for member in staff_members:
+                        if member.id == PRIORITY_STAFF_ID:
+                            target_staff = member
+                            break
+                    
+                    # If you weren't found or have already been contacted, fall back to other online staff
+                    if not target_staff:
+                        online_staff = [m for m in staff_members if m.status != discord.Status.offline]
+                        target_staff = online_staff[0] if online_staff else staff_members[0]
+                    
+                    # Find the original channel
+                    channel = self.guild.get_channel(self.original_channel_id)
+                    if not channel:
+                        logger.error(f"Could not find channel with ID {self.original_channel_id}")
+                        return
+                        
+                    # Create a new view for the new staff member
+                    embed = discord.Embed(
+                        title="🔄 Draft Save State Found (Previous Staff Did Not Respond)",
+                        description=f"A previous draft state requires attention.",
+                        color=discord.Color.gold()  # Different color to indicate it's a follow-up
+                    )
+                    embed.add_field(
+                        name="Save Information",
+                        value=f"• Filename: `{self.filename}`\n• Channel: {channel.mention}"
+                    )
+                    embed.add_field(
+                        name="Time Remaining",
+                        value="This prompt will time out in 5 minutes if no action is taken.",
+                        inline=False
+                    )
+                    
+                    new_view = SaveStatePromptView(
+                        self.state_manager, 
+                        self.guild, 
+                        self.filename, 
+                        self.original_channel_id,
+                        target_staff
+                    )
+                    
+                    try:
+                        # Send DM to new staff member
+                        dm_channel = await target_staff.create_dm()
+                        message = await dm_channel.send(
+                            f"📢 A previous staff member didn't respond to a draft state restore prompt in {channel.mention}.\n"
+                            f"Could you please handle this?",
+                            embed=embed,
+                            view=new_view
+                        )
+                        new_view.message = message
+                        logger.info(f"Sent save state prompt to {target_staff.name} after timeout")
+                    except:
+                        logger.error(f"Could not send DM to {target_staff.name} after timeout")
+                        
+                        # If we can't send a DM, try the next staff member on the next timeout
+                        # The current target_staff will be added to the notification attempts list
+                        # so they won't be selected again
+            except Exception as e:
+                logger.error(f"Error trying to notify another staff member after timeout: {e}")
+        
+        logger.info(f"Save state prompt for {self.filename} timed out")
 
 
 '''HELPER FUNCTIONS'''
@@ -1494,6 +1883,351 @@ class SkipConfirmationView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
+# View with buttons to confirm loading latest state or choose another
+class LoadStateConfirmView(discord.ui.View):
+    def __init__(self, state_manager, guild, saved_states):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.state_manager = state_manager
+        self.guild = guild
+        self.saved_states = saved_states  # List of (filename, timestamp) tuples
+        
+    @discord.ui.button(label="Yes, Load Latest", style=discord.ButtonStyle.primary)
+    async def load_latest_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        if not self.saved_states:
+            await interaction.followup.send("❌ No saved states available.", ephemeral=True)
+            return
+            
+        latest_state = self.saved_states[0][0]
+        
+        try:
+            # Load the state
+            loaded_state, loaded_times = self.state_manager.load_state(
+                latest_state,
+                self.guild
+            )
+            
+            if not loaded_state.get('participants'):
+                await interaction.followup.send(
+                    "⚠️ Warning: No participants found in loaded state",
+                    ephemeral=True
+                )
+                
+            # Update global state
+            draft_state.update(loaded_state)
+            
+            # If there was an active draft with timers, update the remaining times but keep paused
+            if loaded_times:
+                global remaining_times
+                remaining_times.update(loaded_times)
+            
+            # Always set to paused state when loading
+            draft_state['is_paused'] = True
+            
+            # Disable all buttons
+            for child in self.children:
+                child.disabled = True
+            await interaction.edit_original_response(view=self)
+            
+            # Send success message
+            await interaction.followup.send(
+                f"✅ Successfully loaded draft state from `{latest_state}`\n"
+                f"• {len(draft_state.get('participants', []))} participants loaded\n"
+                f"• Draft is now in paused state\n"
+                f"• Use `/resume_draft` to continue",
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load draft state: {e}")
+            await interaction.followup.send(
+                f"❌ Error loading draft state: {str(e)}",
+                ephemeral=True
+            )
+    
+    @discord.ui.button(label="Choose Different State", style=discord.ButtonStyle.secondary)
+    async def choose_state_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.saved_states:
+            await interaction.response.send_message("❌ No saved states available.", ephemeral=True)
+            return
+            
+        # Create view with dropdown to select state
+        select_view = SelectStateView(self.state_manager, self.guild, self.saved_states)
+        
+        # Create embed
+        embed = discord.Embed(
+            title="📂 Select Draft State to Load",
+            description="Choose a saved draft state from the dropdown menu:",
+            color=discord.Color.blue()
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=select_view)
+    
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all buttons
+        for child in self.children:
+            child.disabled = True
+        
+        # Update the message with disabled buttons
+        await interaction.response.edit_message(view=self)
+        
+        # Send confirmation message
+        await interaction.followup.send(
+            "✅ Load state operation cancelled.",
+            ephemeral=True
+        )
+
+# View with dropdown to select a specific state
+class SelectStateView(discord.ui.View):
+    def __init__(self, state_manager, guild, saved_states):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.state_manager = state_manager
+        self.guild = guild
+        self.saved_states = saved_states
+        
+        # Add the dropdown to the view
+        self.add_item(StateSelectMenu(saved_states))
+        self.selected_state = None
+    
+    @discord.ui.button(label="Load Selected State", style=discord.ButtonStyle.primary)
+    async def load_selected_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_state:
+            await interaction.response.send_message(
+                "⚠️ Please select a state from the dropdown first.", 
+                ephemeral=True
+            )
+            return
+            
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Load the selected state
+            loaded_state, loaded_times = self.state_manager.load_state(
+                self.selected_state,
+                self.guild
+            )
+            
+            if not loaded_state.get('participants'):
+                await interaction.followup.send(
+                    "⚠️ Warning: No participants found in loaded state",
+                    ephemeral=True
+                )
+                
+            # Update global state
+            draft_state.update(loaded_state)
+            
+            # If there was an active draft with timers, update the remaining times but keep paused
+            if loaded_times:
+                global remaining_times
+                remaining_times.update(loaded_times)
+            
+            # Always set to paused state when loading
+            draft_state['is_paused'] = True
+            
+            # Disable all components
+            for child in self.children:
+                child.disabled = True
+            
+            # Update the message with disabled components
+            try:
+                await interaction.edit_original_response(view=self)
+            except Exception as e:
+                logger.error(f"Error updating message after state load: {e}")
+            
+            # Send success message
+            await interaction.followup.send(
+                f"✅ Successfully loaded draft state from `{self.selected_state}`\n"
+                f"• {len(draft_state.get('participants', []))} participants loaded\n"
+                f"• Draft is now in paused state\n"
+                f"• Use `/resume_draft` to continue",
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to load selected draft state: {e}")
+            await interaction.followup.send(
+                f"❌ Error loading draft state: {str(e)}",
+                ephemeral=True
+            )
+    
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all components
+        for child in self.children:
+            child.disabled = True
+        
+        # Update the message with disabled components
+        await interaction.response.edit_message(view=self)
+        
+        # Send confirmation message
+        await interaction.followup.send(
+            "✅ Load state operation cancelled.",
+            ephemeral=True
+        )
+
+# Custom Select Menu for state selection
+class StateSelectMenu(discord.ui.Select):
+    def __init__(self, saved_states):
+        # Create select options from saved states
+        options = []
+        
+        # Limit to 25 options max (Discord limit)
+        for i, (filename, timestamp) in enumerate(saved_states[:25]):
+            # Format the timestamp for display
+            dt = datetime.fromisoformat(timestamp)
+            formatted_time = dt.strftime("%Y-%m-%d %H:%M")
+            
+            # Try to extract additional info from the filename to make options more descriptive
+            save_info = f"Save {i+1}: {formatted_time}"
+            try:
+                # If the save file name has a pattern like "draft_state_YYYY-MM-DD_HH-MM-SS.json"
+                # Extract some meaningful information if possible
+                if "_" in filename:
+                    parts = filename.split("_")
+                    if len(parts) >= 3:
+                        # Try to add some context, like "Round X" if that info is in the filename
+                        if any("round" in part.lower() for part in parts):
+                            for part in parts:
+                                if "round" in part.lower():
+                                    save_info = f"{part}: {formatted_time}"
+                                    break
+            except:
+                # If extraction fails, stick with the default format
+                pass
+                
+            # Create option
+            options.append(discord.SelectOption(
+                label=save_info,
+                description=filename[:80] if len(filename) > 80 else filename,  # Limit description length
+                value=filename
+            ))
+        
+        super().__init__(
+            placeholder="Select a saved state...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        # Get the selected state
+        selected = self.values[0]
+        
+        # Store in parent view
+        self.view.selected_state = selected
+        
+        # Acknowledge the selection
+        await interaction.response.send_message(
+            f"Selected state: `{selected}`\nClick 'Load Selected State' to proceed.",
+            ephemeral=True
+        )
+
+# First view with three options: Save and Stop, Stop Without Saving, Cancel
+class StopDraftOptionsView(discord.ui.View):
+    def __init__(self, timeout=60):
+        super().__init__(timeout=timeout)
+        self.value = None
+        self.save_state = None
+        self.clicked = False
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Save and Stop", style=discord.ButtonStyle.danger)
+    async def save_and_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = True
+        self.save_state = True
+        self.stop()
+
+    @discord.ui.button(label="Stop Without Saving", style=discord.ButtonStyle.danger)
+    async def stop_without_saving(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = True
+        self.save_state = False
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = False
+        self.save_state = None
+        self.stop()
+
+    async def on_timeout(self):
+        self.value = None
+        self.save_state = None
+        for item in self.children:
+            item.disabled = True
+
+# Second view with three options: Confirm, Back to Options, Cancel
+class StopDraftConfirmationView(discord.ui.View):
+    def __init__(self, timeout=60):
+        super().__init__(timeout=timeout)
+        self.value = None
+        self.go_back = False
+        self.clicked = False
+
+    async def disable_all_buttons(self, interaction: discord.Interaction):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Yes, I'm Sure", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = True
+        self.go_back = False
+        self.stop()
+
+    @discord.ui.button(label="Back to Stop Options", style=discord.ButtonStyle.primary)
+    async def back_to_options(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = None
+        self.go_back = True
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.clicked:
+            return
+        self.clicked = True
+        
+        await self.disable_all_buttons(interaction)
+        self.value = False
+        self.go_back = False
+        self.stop()
+
+    async def on_timeout(self):
+        self.value = None
+        self.go_back = False
+        for item in self.children:
+            item.disabled = True
+
 '''SLASH COMMANDS'''
 #slash command to set the number of coaches
 def generate_set_coaches_command():
@@ -1647,7 +2381,7 @@ async def start_draft_command(interaction: discord.Interaction):
 )
 @has_draft_staff_role()
 async def stop_draft_command(interaction: discord.Interaction):
-    global  draft_state,participant_timers, remaining_times, auto_saver  # All globals at the top
+    global draft_state, participant_timers, remaining_times, auto_saver
     logger.info(f"{interaction.user.name} attempting emergency draft stop")
     await interaction.response.defer(ephemeral=True)
     
@@ -1658,78 +2392,104 @@ async def stop_draft_command(interaction: discord.Interaction):
         )
         return
 
-    # Send initial message with save options
-    save_options_embed = discord.Embed(
-        title="⚠️ Draft Stop Options",
-        description=(
-            "Please choose how you want to stop the draft:\n\n"
-            "**• Confirm**: Save the current state and stop the draft\n"
-            "**• Cancel**: Cancel this operation\n\n"
-            "If you want to stop without saving, use the second confirmation."
-        ),
-        color=discord.Color.yellow()
-    )
-    save_view = ConfirmationView(timeout=60)
-    
-    await interaction.followup.send(
-        embed=save_options_embed,
-        view=save_view,
-        ephemeral=True
-    )
-
-    # Wait for first confirmation (save decision)
-    await save_view.wait()
-    should_save = save_view.value
-
-    if save_view.value is None:
-        logger.info(f"{interaction.user.name} let stop draft command timeout")
+    # Decision loop to handle the possibility of going back to the first view
+    while True:
+        # Send initial message with stop options
+        stop_options_embed = discord.Embed(
+            title="⚠️ Draft Stop Options",
+            description=(
+                "Please choose how you want to stop the draft:\n\n"
+                "• **Save and Stop**: Save the current state before stopping\n"
+                "• **Stop Without Saving**: Stop without preserving the current state\n"
+                "• **Cancel**: Cancel this operation and continue the draft"
+            ),
+            color=discord.Color.yellow()
+        )
+        options_view = StopDraftOptionsView(timeout=60)
+        
         await interaction.followup.send(
-            "Command timed out. No action taken.",
+            embed=stop_options_embed,
+            view=options_view,
             ephemeral=True
         )
-        return
-    
-    if not save_view.value:
-        # If they hit cancel on the first prompt, exit entirely
-        logger.info(f"{interaction.user.name} cancelled draft stop attempt")
+
+        # Wait for first view decision
+        await options_view.wait()
+        
+        # Handle timeout
+        if options_view.value is None:
+            logger.info(f"{interaction.user.name} let stop draft command timeout")
+            await interaction.followup.send(
+                "Command timed out. No action taken.",
+                ephemeral=True
+            )
+            return
+        
+        # Handle cancel
+        if not options_view.value:
+            logger.info(f"{interaction.user.name} cancelled draft stop attempt")
+            await interaction.followup.send(
+                "✅ Stop draft cancelled. The draft will continue normally.",
+                ephemeral=True
+            )
+            return
+        
+        # Options view returned True, meaning user selected either "Save and Stop" or "Stop Without Saving"
+        should_save = options_view.save_state
+        
+        # Create appropriate confirmation message based on the choice
+        action_text = "save the current state and then stop" if should_save else "stop WITHOUT saving"
+        
+        # Create the confirmation embed
+        stop_confirm_embed = discord.Embed(
+            title="⚠️ WARNING: Confirm Draft Stop",
+            description=(
+                f"Are you sure you want to {action_text} the draft?\n\n"
+                "This will:\n"
+                "• Immediately stop the current draft\n"
+                "• Cancel all active timers\n"
+                f"• {'Save the current state and then clear' if should_save else 'Clear without saving'} all draft data\n"
+                "• Cannot be undone\n\n"
+            ),
+            color=discord.Color.red()
+        )
+        confirmation_view = StopDraftConfirmationView(timeout=60)
+        
         await interaction.followup.send(
-            "✅ Stop draft cancelled. The draft will continue normally.",
+            embed=stop_confirm_embed,
+            view=confirmation_view,
             ephemeral=True
         )
-        return
 
-    # If they confirmed saving, now ask for final confirmation to stop
-    stop_confirm_embed = discord.Embed(
-        title="⚠️ WARNING: Confirm Draft Stop",
-        description=(
-            "This will:\n"
-            "• Immediately stop the current draft\n"
-            "• Cancel all active timers\n"
-            f"• {'Save the current state and then clear' if should_save else 'Clear'} all draft data\n"
-            "• Cannot be undone\n\n"
-            "Are you sure you want to proceed?"
-        ),
-        color=discord.Color.red()
-    )
-    final_view = ConfirmationView(timeout=60)
-    
-    await interaction.followup.send(
-        embed=stop_confirm_embed,
-        view=final_view,
-        ephemeral=True
-    )
+        # Wait for confirmation view
+        await confirmation_view.wait()
+        
+        # If user clicked "Back to Stop Options", restart the loop
+        if confirmation_view.go_back:
+            continue
+            
+        # Handle confirmation timeout
+        if confirmation_view.value is None:
+            logger.info(f"{interaction.user.name} let stop draft confirmation timeout")
+            await interaction.followup.send(
+                "Command timed out. No action taken.",
+                ephemeral=True
+            )
+            return
+            
+        # Handle confirmation cancel
+        if not confirmation_view.value:
+            logger.info(f"{interaction.user.name} cancelled draft stop in final confirmation")
+            await interaction.followup.send(
+                "✅ Stop draft cancelled. The draft will continue normally.",
+                ephemeral=True
+            )
+            return
+            
+        # User confirmed - break out of the decision loop and proceed with stopping
+        break
 
-    # Wait for final confirmation
-    await final_view.wait()
-
-    if not final_view.value:
-        logger.info(f"{interaction.user.name} cancelled draft stop in final confirmation")
-        await interaction.followup.send(
-            "✅ Stop draft cancelled. The draft will continue normally.",
-            ephemeral=True
-        )
-        return
-
+    # If we got here, the user confirmed the stop operation
     try:
         # First capture remaining times for any active timers
         if draft_state["order"]:
@@ -1780,7 +2540,7 @@ async def stop_draft_command(interaction: discord.Interaction):
             "extensions": {},
             "is_paused": False,
             "auto_extensions": {},
-            "draft_phase": "setup"  # Add this line
+            "draft_phase": "setup"
         }
 
         # Send success message
@@ -2460,6 +3220,58 @@ async def swap_pokemon_command(
         logger.error(f"Error in swap_pokemon_command: {e}")
         await interaction.followup.send(
             "❌ An error occurred while processing the swap. Please try again or contact the administrator.",
+            ephemeral=True
+        )
+
+#Slash Command to load a saved draft state
+@bot.tree.command(name="load_state", description="Load a saved draft state (Draft Staff only)", guild=GUILD_ID)
+@has_draft_staff_role()
+async def load_state(interaction: discord.Interaction):
+    """Load a previous draft state (Draft Staff only)"""
+    global draft_state
+    
+    # Check if draft is in setup state
+    if draft_state.get('draft_phase') != "setup":
+        await interaction.response.send_message(
+            "❌ You can only load a previous draft state when the draft is in setup mode.",
+            ephemeral=True
+        )
+        return
+    
+    # Get list of available saved states
+    try:
+        saved_states = state_manager.list_saved_states()
+        if not saved_states:
+            await interaction.response.send_message(
+                "❌ No saved draft states found.",
+                ephemeral=True
+            )
+            return
+            
+        # Create confirmation view for latest state
+        latest_state = saved_states[0][0]
+        saved_time = datetime.fromisoformat(saved_states[0][1])
+        formatted_time = saved_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        view = LoadStateConfirmView(state_manager, interaction.guild, saved_states)
+        
+        # Create embed with latest state info
+        embed = discord.Embed(
+            title="📂 Load Draft State",
+            description="Would you like to load the most recent draft state?",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Latest Save",
+            value=f"• Filename: `{latest_state}`\n• Saved: {formatted_time}"
+        )
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Error listing saved states: {e}")
+        await interaction.response.send_message(
+            f"❌ Error listing saved states: {str(e)}",
             ephemeral=True
         )
 
