@@ -23,8 +23,9 @@ class DraftState:
     timestamp: str
 
 class StateManager:
-    def __init__(self, save_directory: str = "draft_states"):
+    def __init__(self, save_directory: str = "draft_states", max_saves: int = 10):
         self.save_directory = save_directory
+        self.max_saves = max_saves  # Maximum number of save files to keep
         if not os.path.exists(save_directory):
             os.makedirs(save_directory)
         self.logger = logging.getLogger(__name__)
@@ -98,6 +99,9 @@ class StateManager:
             if filename is None:
                 filename = f"draft_state_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
 
+            # Check if we need to clean up old save files
+            self._manage_save_limit()
+
             filepath = os.path.join(self.save_directory, filename)
             
             with open(filepath, 'w') as f:
@@ -109,6 +113,37 @@ class StateManager:
         except Exception as e:
             self.logger.error(f"Error saving draft state: {e}")
             raise
+    
+    def _manage_save_limit(self):
+        """Ensure we don't exceed max_saves limit by removing oldest save files"""
+        try:
+            # Get list of all save files with their timestamps
+            save_files = []
+            for filename in os.listdir(self.save_directory):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(self.save_directory, filename)
+                    mod_time = os.path.getmtime(filepath)
+                    save_files.append((filename, mod_time, filepath))
+            
+            # If we're under the limit, do nothing
+            if len(save_files) < self.max_saves:
+                return
+                
+            # Sort files by modification time (oldest first)
+            save_files.sort(key=lambda x: x[1])
+            
+            # Delete oldest files to get back to the limit
+            files_to_delete = len(save_files) - self.max_saves + 1  # +1 for the new file we're about to create
+            for i in range(files_to_delete):
+                if i < len(save_files):
+                    oldest_file = save_files[i][2]  # Full path to the file
+                    os.remove(oldest_file)
+                    self.logger.info(f"Deleted oldest save file: {save_files[i][0]} to maintain {self.max_saves} save limit")
+        
+        except Exception as e:
+            self.logger.error(f"Error managing save file limits: {e}")
+            # Don't raise the exception - just log it and continue
+            # This way, saving will still work even if cleanup fails
 
     def load_state(self, filename: str, guild: discord.Guild) -> tuple[dict, dict]:
         """Load a draft state from a file"""
