@@ -1,17 +1,10 @@
 '''
-v0.57 - New Attempt to implement Draft State for when the bot goes down -halfway there
 
-    0.57.1 Timers look like are restored ok now and draft state as well. A few things to check like 
-    0.57.2 the restoring with coacches 0  (Will have to refactor how selected_coaches and participants work - completed and working [apparently])
-    0.57.3 Also need to replicate the Google Sheets update ->skipping turn only 6 places update -COMPLETED, reorganized pivot sheet updates so API request are less and only have the draft picks and skipped turns in the sheets
-0.58 Make it so .json gets created once when paused and then stop autosave, resume when draft gets resumed -OK
-    0.58.1 also need to check the ephemeral marked embeds that are not being ephemeral (skip) - ok
-0.59 Lastly check why the commands in draft_state_commands.py arent showing and see which are useful - resolved
-    0.59.1 Got rid of the draft_state_commands.py - I'll add management state commands directly in main (ok)
-0.60 an option to load and not just auto-load the latest .json looks like a good option and handle the .json files - OK
-    0.60.1 bot now only creates 15 .json files max and delete oldest after reaching the limit -OK 
-
-Once finished, new version should be v0.6
+v0.61 - handles the token expiration limit of 15 min for API interaction, redos the timer to avoid time drift
+    0.61.1 - pending to fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration)
+                ^already in co-pilot but not tried
+    Pending- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
+    After that is corrected, work on improving the /my_draft embed format and figure out how to include the team logo in the final collage
 '''
 '''LIBRARIES'''
 import discord                          #Core Discord.py functionality 
@@ -1258,6 +1251,34 @@ class SaveStatePromptView(discord.ui.View):
 
 
 '''HELPER FUNCTIONS'''
+# Helper function to send timer notifications
+# Updated send_timer_notification function to support references
+async def send_timer_notification(participant, channel, message, reference_message=None):
+    """
+    Sends a notification to a participant about their timer.
+    First attempts to send a DM, if that fails, sends a message in the channel.
+    """
+    try:
+        # Try to send a DM first
+        dm_channel = await participant.create_dm()
+        await dm_channel.send(message)
+        logger.info(f"Sent timer notification DM to {participant.name}")
+        
+        # Also send a minimal notification in the channel
+        await channel.send(
+            f"⏰ Timer notification sent to {participant.mention}",
+            reference=reference_message  # Add reference to create a reply
+        )
+        
+    except Exception as e:
+        # If DM fails, send message in the channel
+        logger.warning(f"Failed to send DM to {participant.name}: {e}")
+        await channel.send(
+            message,
+            reference=reference_message  # Add reference to create a reply
+        )
+        logger.info(f"Sent timer notification in channel to {participant.name}")
+
 ## Split Validations into Helper Functions##
 async def validate_draft_state(interaction: discord.Interaction, user) -> bool:
     """Check if draft exists and user can pick"""
@@ -1523,38 +1544,52 @@ def format_time(seconds: int) -> str:
     seconds_remaining = seconds % 60
     return f"{minutes}:{seconds_remaining:02}"  # Ensures seconds are always 2 digits
 
-async def create_interaction(channel):
+def create_interaction(channel):
     """
     Creates a minimal interaction-like object that works with start_timer
     """
+    class FollowupSender:
+        def __init__(self, channel):
+            self.channel = channel
+            
+        async def send(self, content, **kwargs):
+            return await self.channel.send(content, **kwargs)
+    
     class MinimalInteraction:
         def __init__(self, channel):
-            self._channel = channel
-            
-        async def followup(self):
-            return self._channel
+            self.channel = channel
+            self.followup = FollowupSender(channel)
             
         async def send(self, *args, **kwargs):
-            return await self._channel.send(*args, **kwargs)
+            return await self.channel.send(*args, **kwargs)
     
     return MinimalInteraction(channel)
 
 #Function that starts the timer
-async def start_timer(interaction: discord.Interaction, participant, adjusted_duration=None):
+async def start_timer(interaction, participant, adjusted_duration=None, reference_message=None):
     global participant_timers, remaining_times
 
+    # Make sure we can access the channel
+    if not hasattr(interaction, "channel") or not interaction.channel:
+        logger.error(f"No channel available for timer, cannot proceed for {participant.name}")
+        return
+    
+    channel = interaction.channel
+    
     # Calculate the adjusted timer duration based on skipped turns if not provided
     if adjusted_duration is None:
         skipped_turns = draft_state["skipped_turns"].get(participant, 0)
         if skipped_turns == 1:
             adjusted_duration = TIMER_DURATION // 2  # Half the initial time
-            await interaction.followup.send(
-                f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(adjusted_duration)}**."
+            await channel.send(
+                f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(adjusted_duration)}**.",
+                reference=reference_message  # Add reference to create a reply
             )
         elif skipped_turns >= 2:
             adjusted_duration = TIMER_DURATION // 4  # Quarter of the initial time
-            await interaction.followup.send(
-                f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(adjusted_duration)}**."
+            await channel.send(
+                f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(adjusted_duration)}**.",
+                reference=reference_message  # Add reference to create a reply
             )
         else:
             adjusted_duration = TIMER_DURATION  # Initial time
@@ -1566,19 +1601,87 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
     else:
         logger.info(f"Starting new timer for {participant.name}: {adjusted_duration} seconds")
 
+    # Calculate the end time for the timer (using absolute time)
+    end_time = time.time() + adjusted_duration
     remaining_time = adjusted_duration
-    remaining_times[participant] = remaining_time  # <-- Add this line or delete if timers
-    # Send an initial message with the timer
-    timer_message = await interaction.followup.send(
-        f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**"
+    remaining_times[participant] = remaining_time
+    
+    # Send initial timer message, as a reply if we have a reference message
+    timer_message = await channel.send(
+        f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**",
+        reference=reference_message  # Add reference to create a reply
     )
+    
+    # Create notification flags
+    halfway_notified = False
+    one_sixth_notified = False
+    
+    # Calculate notification thresholds if duration is at least 15 minutes
+    should_notify = adjusted_duration >= 900  # 15 minutes = 900 seconds
+    halfway_threshold = adjusted_duration // 2 if should_notify else 0
+    one_sixth_threshold = adjusted_duration // 6 if should_notify else 0
+    
+    # This will be used for message update throttling
+    last_update_time = 0
+    update_interval = 1  # Update the timer message every second
 
-    # Countdown loop
-    while remaining_time > 0:
+    # Countdown loop with absolute time tracking
+    while True:
         try:
-            await asyncio.sleep(1)  # Wait for 1 second
-            remaining_time -= 1
-            await timer_message.edit(content=f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**")
+            # Calculate the current remaining time based on the end time
+            now = time.time()
+            remaining_time = max(0, int(end_time - now))
+            remaining_times[participant] = remaining_time
+            
+            # Exit the loop if the timer has expired
+            if remaining_time <= 0:
+                break
+                
+            # Only update the message if enough time has passed (throttling to reduce API load)
+            current_time = time.time()
+            if current_time - last_update_time >= update_interval:
+                try:
+                    # Try to edit the existing message
+                    await timer_message.edit(
+                        content=f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**"
+                    )
+                    last_update_time = current_time
+                except discord.errors.HTTPException as e:
+                    # If the edit fails (likely token expired after ~15 minutes)
+                    logger.warning(f"Failed to edit timer message: {e}")
+                    
+                    # Create a new message instead, as a reply to maintain threading
+                    timer_message = await channel.send(
+                        f"⏰ Time remaining for {participant.mention}: **{format_time(remaining_time)}**",
+                        reference=reference_message  # Keep using the same reference
+                    )
+                    last_update_time = current_time
+            
+            # Check for notification thresholds
+            if should_notify:
+                # Halfway notification
+                if not halfway_notified and remaining_time <= halfway_threshold:
+                    halfway_notified = True
+                    await send_timer_notification(
+                        participant,
+                        channel,
+                        f"⏳ {participant.mention}, you have **{format_time(remaining_time)}** remaining for your turn (half of your time).",
+                        reference_message  # Pass the reference message
+                    )
+                    
+                # One-sixth notification
+                if not one_sixth_notified and remaining_time <= one_sixth_threshold:
+                    one_sixth_notified = True
+                    await send_timer_notification(
+                        participant,
+                        channel,
+                        f"⚠️ {participant.mention}, you have only **{format_time(remaining_time)}** remaining for your turn (final reminder).",
+                        reference_message  # Pass the reference message
+                    )
+            
+            # Sleep for a short time (shorter than the update interval to ensure accuracy)
+            await asyncio.sleep(0.5)  # Sleep for half a second
+                
         except asyncio.CancelledError:
             # Timer was canceled, store the remaining time only if it was extended
             remaining_times[participant] = remaining_time
@@ -1586,12 +1689,14 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
             return
 
     # Notify when the timer runs out
-    await interaction.followup.send(f"⏰ Time's up for {participant.mention}! Moving to the next participant.")
+    timeout_message = await channel.send(
+        f"⏰ Time's up for {participant.mention}! Moving to the next participant.",
+        reference=reference_message  # Add reference to create a reply
+    )
 
     # Increment the skipped turns counter for the participant
     if participant in draft_state["skipped_turns"]:
         draft_state["skipped_turns"][participant] += 1
-        # Update Google Sheet to reflect the new skip count
         try:
             update_google_sheet()
             logger.info(f"Updated Google Sheet after {participant.name} timed out")
@@ -1600,8 +1705,10 @@ async def start_timer(interaction: discord.Interaction, participant, adjusted_du
     else:
         draft_state["skipped_turns"][participant] = 1
 
-    # Move to the next participant
-    await next_participant(interaction)
+    # Move to the next participant using a fresh minimal interaction
+    next_interaction = create_interaction(channel)
+    # Pass the reference message to keep the reply chain
+    await next_participant(next_interaction, reference_message=reference_message)
 
 #Function that cancels the timer
 async def cancel_timer(participant):
@@ -1667,28 +1774,70 @@ async def extend_timer(interaction: discord.Interaction, participant, extend_tim
     timer_task = asyncio.create_task(start_timer(interaction, participant, new_duration))
     participant_timers[participant] = timer_task
     
-#Function that notifies the current participant
-async def notify_current_participant(interaction: discord.Interaction):
+# Modified notify_current_participant to track reference messages
+async def notify_current_participant(interaction, reference_message=None):
     global participant_timers
 
     # Get the current participant
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
     remaining_points = draft_state["teams"][current_user]["points"]
     remaining_picks = draft_size - len(draft_state["teams"][current_user]["pokemon"])
-
-    # Notify the current participant
-    await interaction.followup.send(
+    
+    # Get the channel in a safe way
+    channel = None
+    if hasattr(interaction, "channel") and interaction.channel:
+        channel = interaction.channel
+    
+    if not channel and draft_state.get("draft_channel_id"):
+        # Fallback to getting channel from the draft_channel_id
+        guild = bot.get_guild(interaction.guild_id)
+        if guild:
+            channel = guild.get_channel(draft_state["draft_channel_id"])
+    
+    if not channel:
+        logger.error("Could not get channel for notification")
+        return
+    
+    # Notification message
+    notification = (
         f"It's {current_user.mention}'s turn to pick!\n"
         f"You have **{remaining_points} points** and must pick **{remaining_picks} more Pokémon**."
     )
 
-    # Start the timer for the current participant
-    timer_task = asyncio.create_task(start_timer(interaction, current_user))
-    participant_timers[current_user] = timer_task #Store timer task
+    # Send the notification, storing the message for reference
+    try:
+        # Try using the interaction first
+        notif_message = await interaction.followup.send(notification)
+        # If no reference message provided, use this notification as the reference
+        if reference_message is None:
+            reference_message = notif_message
+    except (discord.errors.HTTPException, AttributeError) as e:
+        # If interaction token expired or followup doesn't exist
+        logger.warning(f"Could not use interaction for notification: {e}")
+        notif_message = await channel.send(
+            notification,
+            reference=reference_message  # Use existing reference if available
+        )
+        # If no reference message provided, use this notification as the reference
+        if reference_message is None:
+            reference_message = notif_message
+
+    # Create a new minimal interaction specifically for the timer
+    timer_interaction = create_interaction(channel)
+    
+    # Start the timer for the current participant, passing the reference message
+    timer_task = asyncio.create_task(
+        start_timer(timer_interaction, current_user, reference_message=reference_message)
+    )
+    participant_timers[current_user] = timer_task  # Store timer task
 
 #Function that pivots to next participant
-async def next_participant(interaction: discord.Interaction):
+# Updated next_participant function to handle references
+async def next_participant(interaction, reference_message=None):
     global draft_state, remaining_times
+
+    # Store channel for direct use if interaction fails
+    channel = interaction.channel
 
     # Cancel the timer for the current participant
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
@@ -1714,8 +1863,8 @@ async def next_participant(interaction: discord.Interaction):
         draft_state["current_pick"] += 1  # Skip this participant
         current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
 
-    # Notify the next participant
-    await notify_current_participant(interaction)
+    # Notify the next participant, passing along the reference message
+    await notify_current_participant(interaction, reference_message=reference_message)
 
 #Function to Check Stall Group Limits
 def has_reached_stall_limit(user):
