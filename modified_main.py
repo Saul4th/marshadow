@@ -1,8 +1,8 @@
 '''
 
 v0.61 - handles the token expiration limit of 15 min for API interaction, redos the timer to avoid time drift
-    0.61.1 - pending to fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration)
-                ^already in co-pilot but not tried
+    0.61.1 - fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration) -OK
+
     Pending- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
     After that is corrected, work on improving the /my_draft embed format and figure out how to include the team logo in the final collage
 '''
@@ -526,7 +526,8 @@ draft_state = {
     'extensions': {},
     'is_paused': False,
     'auto_extensions': {},
-    'draft_phase': 'setup'       # New field: 'setup', 'active', or 'inactive'
+    'draft_phase': 'setup',      # New field: 'setup', 'active', or 'inactive'
+    'main_message': None
 }
 
 #Error Handler
@@ -1046,10 +1047,11 @@ class SaveStatePromptView(discord.ui.View):
                             except Exception as e:
                                 logger.error(f"Failed to update Draft Sheet after restoration: {e}")
                             
-                            # Use the existing start_timer with the remaining time
+                            # Use the existing start_timer with the remaining time AND EXPLICIT REFERENCE
                             timer_task = asyncio.create_task(
-                                start_timer(mock_interaction, current_participant, remaining_time)
+                                start_timer(mock_interaction, current_participant, remaining_time, reference_message=initial_message)
                             )
+
                             participant_timers[current_participant] = timer_task
                             remaining_times[current_participant] = remaining_time
                             logger.info(f"Successfully restored timer for {current_participant.name}")
@@ -1512,9 +1514,13 @@ async def start_draft(interaction: discord.Interaction, participants: list[disco
         draft_state["draft_channel_id"] = interaction.channel.id
 
         # Send the draft start message
-        await interaction.followup.send(
+        start_message = await interaction.followup.send(
             "Draft started! \n\nThe order is:\n" + "\n".join([member.mention for member in draft_state["participants"]]) + "\n in snake format"
         )
+
+        # Store the message as the main reference point for replies
+        draft_state["main_message"] = start_message
+        logger.info("Set start message as main_message reference")
 
         # Update Google Sheet to reflect the new skip count
         try:
@@ -1523,8 +1529,8 @@ async def start_draft(interaction: discord.Interaction, participants: list[disco
         except Exception as e:
             logger.error(f"Failed to update Google Sheet after starting a new draft")
 
-        # Notify the first participant and start the timer
-        await notify_current_participant(interaction)
+        # Notify the first participant using our new reference message
+        await notify_current_participant(interaction, reference_message=start_message)
 
     except Exception as e:
         logger.error(f"Error starting draft: {e}")
@@ -1544,26 +1550,33 @@ def format_time(seconds: int) -> str:
     seconds_remaining = seconds % 60
     return f"{minutes}:{seconds_remaining:02}"  # Ensures seconds are always 2 digits
 
-def create_interaction(channel):
+def create_interaction(channel, reference_message=None):
     """
     Creates a minimal interaction-like object that works with start_timer
     """
     class FollowupSender:
-        def __init__(self, channel):
+        def __init__(self, channel, reference_message=None):
             self.channel = channel
+            self.reference_message = reference_message
             
         async def send(self, content, **kwargs):
+            # If we have a reference message, use it
+            if self.reference_message:
+                kwargs['reference'] = self.reference_message
             return await self.channel.send(content, **kwargs)
     
     class MinimalInteraction:
-        def __init__(self, channel):
+        def __init__(self, channel, reference_message=None):
             self.channel = channel
-            self.followup = FollowupSender(channel)
+            self.followup = FollowupSender(channel, reference_message)
             
         async def send(self, *args, **kwargs):
+            # If we have a reference message, use it
+            if reference_message:
+                kwargs['reference'] = reference_message
             return await self.channel.send(*args, **kwargs)
     
-    return MinimalInteraction(channel)
+    return MinimalInteraction(channel, reference_message)
 
 #Function that starts the timer
 async def start_timer(interaction, participant, adjusted_duration=None, reference_message=None):
@@ -1705,10 +1718,9 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
     else:
         draft_state["skipped_turns"][participant] = 1
 
-    # Move to the next participant using a fresh minimal interaction
-    next_interaction = create_interaction(channel)
-    # Pass the reference message to keep the reply chain
-    await next_participant(next_interaction, reference_message=reference_message)
+    # Move to the next participant using a fresh minimal interaction with the reference
+    next_interaction = create_interaction(channel, timeout_message)  # Pass the timeout message
+    await next_participant(next_interaction, reference_message=timeout_message)
 
 #Function that cancels the timer
 async def cancel_timer(participant):
@@ -1775,8 +1787,10 @@ async def extend_timer(interaction: discord.Interaction, participant, extend_tim
     participant_timers[participant] = timer_task
     
 # Modified notify_current_participant to track reference messages
+# Modified notify_current_participant to handle webhook limitations
+# Modified notify_current_participant to handle message threading properly
 async def notify_current_participant(interaction, reference_message=None):
-    global participant_timers
+    global draft_state, participant_timers
 
     # Get the current participant
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
@@ -1804,35 +1818,71 @@ async def notify_current_participant(interaction, reference_message=None):
         f"You have **{remaining_points} points** and must pick **{remaining_picks} more Pokémon**."
     )
 
-    # Send the notification, storing the message for reference
+    # Send notification as a reply if we have a reference message, otherwise as a normal message
     try:
-        # Try using the interaction first
-        notif_message = await interaction.followup.send(notification)
-        # If no reference message provided, use this notification as the reference
-        if reference_message is None:
-            reference_message = notif_message
-    except (discord.errors.HTTPException, AttributeError) as e:
-        # If interaction token expired or followup doesn't exist
-        logger.warning(f"Could not use interaction for notification: {e}")
-        notif_message = await channel.send(
-            notification,
-            reference=reference_message  # Use existing reference if available
-        )
-        # If no reference message provided, use this notification as the reference
-        if reference_message is None:
-            reference_message = notif_message
+        # First check if we're dealing with a minimal interaction with a reference
+        if hasattr(interaction, 'followup') and hasattr(interaction.followup, 'reference_message') and interaction.followup.reference_message:
+            # Use the reference directly from the minimal interaction
+            reference_to_use = interaction.followup.reference_message
+            notif_message = await channel.send(notification, reference=reference_to_use)
+            logger.info("Sent notification as reply using MinimalInteraction reference")
+        
+        # If not, check if we have a reference passed directly
+        elif reference_message:
+            notif_message = await channel.send(notification, reference=reference_message)
+            logger.info("Sent notification as reply using passed reference")
+            
+        # Otherwise try followup or regular channel send
+        elif hasattr(interaction, "followup"):
+            try:
+                # Webhook doesn't support references, so we send a normal message
+                notif_message = await interaction.followup.send(notification)
+                logger.info("Sent notification using interaction.followup")
+            except Exception as e:
+                # If followup send fails, fall back to channel.send
+                logger.warning(f"followup.send failed: {e}")
+                notif_message = None
+        else:
+            notif_message = None
+            
+        # If followup failed or wasn't available, use channel send with reference
+        if not notif_message:
+            if reference_message:
+                notif_message = await channel.send(
+                    notification,
+                    reference=reference_message  # Use reference to create thread
+                )
+                logger.info("Sent notification as reply to reference message")
+            else:
+                notif_message = await channel.send(notification)
+                logger.info("Sent notification as new message (no reference)")
+            
+        # Store this as main_message if we don't have one yet
+        if 'main_message' not in draft_state or draft_state['main_message'] is None:
+            draft_state['main_message'] = notif_message
+            logger.info("Set notification message as main_message reference")
+            
+    except Exception as e:
+        logger.error(f"Failed to send notification: {e}")
+        # Last resort: try direct channel.send without reference
+        try:
+            notif_message = await channel.send(notification)
+            logger.info("Sent notification as direct channel message after error")
+        except Exception as e2:
+            logger.error(f"Complete failure to send notification: {e2}")
+            return
 
     # Create a new minimal interaction specifically for the timer
     timer_interaction = create_interaction(channel)
     
-    # Start the timer for the current participant, passing the reference message
+    # Start the timer for the current participant
+    # Always use notif_message as reference for the timer
     timer_task = asyncio.create_task(
-        start_timer(timer_interaction, current_user, reference_message=reference_message)
+        start_timer(timer_interaction, current_user, reference_message=notif_message)
     )
     participant_timers[current_user] = timer_task  # Store timer task
 
-#Function that pivots to next participant
-# Updated next_participant function to handle references
+# Updated next_participant function to maintain message threading
 async def next_participant(interaction, reference_message=None):
     global draft_state, remaining_times
 
@@ -1863,7 +1913,8 @@ async def next_participant(interaction, reference_message=None):
         draft_state["current_pick"] += 1  # Skip this participant
         current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
 
-    # Notify the next participant, passing along the reference message
+    # Pass along the reference_message to notify_current_participant
+    # Always provide a reference if we have one
     await notify_current_participant(interaction, reference_message=reference_message)
 
 #Function to Check Stall Group Limits
@@ -2956,7 +3007,7 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
 
     # --- 7. Send announcement ---
     embed = create_pick_announcement_embed(user, pokemon_name, pokemon_info)
-    await interaction.followup.send(embed=embed)
+    pick_message = await interaction.followup.send(embed=embed)
 
     # --- 8. Handle draft progression ---
     if len(draft_state["teams"][user]["pokemon"]) < draft_size:
@@ -2979,7 +3030,8 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
         await interaction.followup.send("The draft has finished! The draft state has been reset.", ephemeral=True)
         return
 
-    await next_participant(interaction)
+    # Update this line to pass the pick_message as reference
+    await next_participant(interaction, reference_message=pick_message)
 
 # Function to autocomplete for Pokémon names (specific to the guild) [Here because is tied to /pick_pokemon]
 @pick_pokemon.autocomplete('pokemon_name')
@@ -3098,15 +3150,31 @@ async def resume_draft_command(interaction: discord.Interaction):
     # Set the draft to active state
     draft_state["is_paused"] = False
 
-    # Resume the timer for the current participant
+    # Get the current user
     current_user = draft_state["order"][draft_state["current_pick"] % len(draft_state["order"])]
     remaining_time = remaining_times.get(current_user, TIMER_DURATION)
-    timer_task = asyncio.create_task(start_timer(interaction, current_user, remaining_time))
+    
+    # Using defer() and followup.send() to get a proper message object
+    await interaction.response.defer()
+    
+    # Webhooks don't support references, so just send a regular message
+    resume_message = await interaction.followup.send(
+        f"🎮 **Draft Resumed!**\n\n"
+        f"Continuing from pick #{draft_state['current_pick'] + 1} with "
+        f"{current_user.mention}'s turn."
+    )
+    
+    # Store the message as our main reference
+    draft_state["main_message"] = resume_message
+    
+    # Start the timer using the resume_message as reference
+    timer_task = asyncio.create_task(
+        start_timer(interaction, current_user, remaining_time, reference_message=resume_message)
+    )
     participant_timers[current_user] = timer_task
 
     logger.info(f"User {interaction.user.name} successfully resumed draft - {current_user.name} has {remaining_time} seconds remaining")
-    await interaction.response.send_message(f"The draft has been resumed. {current_user.mention}, you have {format_time(remaining_time)} remaining.")
-
+    
     # Restart auto-saver
     await auto_saver.start()
 
