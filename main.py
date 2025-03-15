@@ -3,7 +3,7 @@
 v0.61 - handles the token expiration limit of 15 min for API interaction, redos the timer to avoid time drift
     0.61.1 - fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration) -OK
 
-    Pending- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
+    0.61.2 WIP- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
     After that is corrected, work on improving the /my_draft embed format and figure out how to include the team logo in the final collage
 '''
 '''LIBRARIES'''
@@ -27,14 +27,13 @@ from datetime import datetime, UTC, timezone                       #For handling
 from dataclasses import dataclass       # For creating the SecurityMetadata class with clean attribute definitions
 import secrets                          # For generating cryptographically strong random keys for instance tracking
 from typing import Optional             # For type hinting functions that might return None (like get_sheets_client)
-'''v0.57'''
 from state_manager import StateManager
 import signal
 import sys
 import time
 import random
 import json
-from typing import List
+
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
 '''GLOBAL VARIABLES'''
@@ -58,7 +57,7 @@ total_points = 400
 coaches_size = 2 # Default value
 
 # Timer duration (in seconds)
-TIMER_DURATION = 60  # Default timer duration (1 minute)
+TIMER_DURATION = 720 # Default timer duration (1 minute)
 timer_task = None  # Global variable to store the timer task
 
 # Dictionary to store timers for each participant
@@ -516,8 +515,8 @@ def update_google_sheet(is_intentional_clear=False):
 
 # Draft state
 draft_state = {
-    'draft_channel_id': None,   #Unsure if this should be here
-    'participants': [],           # Will now hold both setup and active participants
+    'draft_channel_id': None,   
+    'participants': [],           
     'order': [],
     'current_pick': 0,
     'teams': {},
@@ -526,8 +525,10 @@ draft_state = {
     'extensions': {},
     'is_paused': False,
     'auto_extensions': {},
-    'draft_phase': 'setup',      # New field: 'setup', 'active', or 'inactive'
-    'main_message': None
+    'draft_phase': 'setup',
+    'main_message': None,
+    'turn_original_durations': {},
+    'notification_flags': {}  # Add this new field
 }
 
 #Error Handler
@@ -594,7 +595,7 @@ state_manager = StateManager()
 
 # Autosaver
 class AutoSaver:
-    def __init__(self, state_manager, save_interval=30):
+    def __init__(self, state_manager, save_interval=600):   #<--Interval is the duration in seconds between autosaves
         self.state_manager = state_manager
         self.save_interval = save_interval
         self.task = None
@@ -1265,13 +1266,7 @@ async def send_timer_notification(participant, channel, message, reference_messa
         dm_channel = await participant.create_dm()
         await dm_channel.send(message)
         logger.info(f"Sent timer notification DM to {participant.name}")
-        
-        # Also send a minimal notification in the channel
-        await channel.send(
-            f"⏰ Timer notification sent to {participant.mention}",
-            reference=reference_message  # Add reference to create a reply
-        )
-        
+                
     except Exception as e:
         # If DM fails, send message in the channel
         logger.warning(f"Failed to send DM to {participant.name}: {e}")
@@ -1498,6 +1493,12 @@ def process_pick(user: discord.Member, pokemon_name: str, pokemon_info: dict) ->
     else:
         logger.info(f"No remaining time to clear for {user.name}.")
     
+    # Reset notification flags for the user
+    draft_state['notification_flags'][user] = {
+        'halfway_notified': False,
+        'one_sixth_notified': False
+    }
+
     return draft_state["teams"][user]["points"]
  
 # Function to start the draft (updated in v0.50)
@@ -1589,29 +1590,44 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
     
     channel = interaction.channel
     
-    # Calculate the adjusted timer duration based on skipped turns if not provided
+    # Initialize notification flags for this participant if not exists
+    if participant not in draft_state['notification_flags']:
+        draft_state['notification_flags'][participant] = {
+            'halfway_notified': False,
+            'one_sixth_notified': False
+        }
+
+    # First, determine the original duration for this turn
+    original_duration = None
     if adjusted_duration is None:
         skipped_turns = draft_state["skipped_turns"].get(participant, 0)
         if skipped_turns == 1:
-            adjusted_duration = TIMER_DURATION // 2  # Half the initial time
+            original_duration = TIMER_DURATION // 2  # Half the initial time
             await channel.send(
                 f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(adjusted_duration)}**.",
                 reference=reference_message  # Add reference to create a reply
             )
         elif skipped_turns >= 2:
-            adjusted_duration = TIMER_DURATION // 4  # Quarter of the initial time
+            original_duration = TIMER_DURATION // 4  # Quarter of the initial time
             await channel.send(
                 f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(adjusted_duration)}**.",
                 reference=reference_message  # Add reference to create a reply
             )
         else:
-            adjusted_duration = TIMER_DURATION  # Initial time
+            original_duration = TIMER_DURATION
+
+        adjusted_duration = original_duration
 
     # Check if there's an existing remaining time and not an extension
     if participant in remaining_times and adjusted_duration is None:
         adjusted_duration = remaining_times[participant]
+        # Use the stored original duration if available
+        original_duration = draft_state['turn_original_durations'].get(participant, adjusted_duration)
         logger.info(f"Resuming timer for {participant.name}: {adjusted_duration} seconds")
     else:
+        # If this is a new turn or extension, store the original duration
+        if original_duration is not None:
+            draft_state['turn_original_durations'][participant] = original_duration
         logger.info(f"Starting new timer for {participant.name}: {adjusted_duration} seconds")
 
     # Calculate the end time for the timer (using absolute time)
@@ -1629,10 +1645,11 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
     halfway_notified = False
     one_sixth_notified = False
     
-    # Calculate notification thresholds if duration is at least 15 minutes
-    should_notify = adjusted_duration >= 900  # 15 minutes = 900 seconds
-    halfway_threshold = adjusted_duration // 2 if should_notify else 0
-    one_sixth_threshold = adjusted_duration // 6 if should_notify else 0
+    # Calculate notification thresholds based on the ORIGINAL duration for this turn
+    original_duration = draft_state['turn_original_durations'].get(participant, adjusted_duration)
+    should_notify = original_duration >= 600  # 15 minutes = 900 seconds
+    halfway_threshold = original_duration // 2 if should_notify else 0
+    one_sixth_threshold = original_duration // 6 if should_notify else 0
     
     # This will be used for message update throttling
     last_update_time = 0
@@ -1673,23 +1690,23 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
             # Check for notification thresholds
             if should_notify:
                 # Halfway notification
-                if not halfway_notified and remaining_time <= halfway_threshold:
-                    halfway_notified = True
+                if not draft_state['notification_flags'][participant]['halfway_notified'] and remaining_time < halfway_threshold:
+                    draft_state['notification_flags'][participant]['halfway_notified'] = True
                     await send_timer_notification(
                         participant,
                         channel,
-                        f"⏳ {participant.mention}, you have **{format_time(remaining_time)}** remaining for your turn (half of your time).",
-                        reference_message  # Pass the reference message
+                        f"⏳ {participant.mention}, you have **{-(-remaining_time//60)}** minutes for your turn (half of your time).",
+                        reference_message
                     )
                     
                 # One-sixth notification
-                if not one_sixth_notified and remaining_time <= one_sixth_threshold:
-                    one_sixth_notified = True
+                if not draft_state['notification_flags'][participant]['one_sixth_notified'] and remaining_time < one_sixth_threshold:
+                    draft_state['notification_flags'][participant]['one_sixth_notified'] = True
                     await send_timer_notification(
                         participant,
                         channel,
-                        f"⚠️ {participant.mention}, you have only **{format_time(remaining_time)}** remaining for your turn (final reminder).",
-                        reference_message  # Pass the reference message
+                        f"⚠️ {participant.mention}, you have only **{-(-remaining_time//60)}** minutes remaining for your turn (final reminder).",
+                        reference_message
                     )
             
             # Sleep for a short time (shorter than the update interval to ensure accuracy)
@@ -2740,7 +2757,11 @@ async def stop_draft_command(interaction: discord.Interaction):
             "extensions": {},
             "is_paused": False,
             "auto_extensions": {},
-            "draft_phase": "setup"
+            "draft_phase": "setup",
+            "draft_channel_id": None,
+            "main_message": None,
+            "turn_original_durations": {},
+            "notification_flags": {}  # Add this new field
         }
 
         # Send success message
