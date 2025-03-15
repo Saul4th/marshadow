@@ -3,7 +3,7 @@
 v0.61 - handles the token expiration limit of 15 min for API interaction, redos the timer to avoid time drift
     0.61.1 - fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration) -OK
 
-    0.61.2 WIP- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
+    0.61.2 Alledgedly OK- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
     After that is corrected, work on improving the /my_draft embed format and figure out how to include the team logo in the final collage
 '''
 '''LIBRARIES'''
@@ -1340,6 +1340,8 @@ async def show_final_teams(interaction: discord.Interaction):
         draft_state["order"] = []
         draft_state["current_pick"] = 0
         draft_state["draft_phase"] = "setup"  # Reset phase to setup
+        # Clear notification flags along with other state
+        draft_state["notification_flags"] = {}
 
          # Stop auto-save
         await auto_saver.stop()
@@ -1512,6 +1514,7 @@ async def start_draft(interaction: discord.Interaction, participants: list[disco
         draft_state["teams"] = {member: {"pokemon": [], "points": total_points} for member in participants}
         draft_state["available_pokemon"] = pokemon_names.copy()
         draft_state["skipped_turns"] = {member: 0 for member in participants}
+        draft_state["notification_flags"] = {member: {'halfway_notified': False, 'one_sixth_notified': False} for member in participants}  # Initialize for all participants
         draft_state["draft_channel_id"] = interaction.channel.id
 
         # Send the draft start message
@@ -1723,6 +1726,11 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
         f"⏰ Time's up for {participant.mention}! Moving to the next participant.",
         reference=reference_message  # Add reference to create a reply
     )
+    # Reset notification flags for the timed out user
+    draft_state['notification_flags'][participant] = {
+        'halfway_notified': False,
+        'one_sixth_notified': False
+    }
 
     # Increment the skipped turns counter for the participant
     if participant in draft_state["skipped_turns"]:
@@ -2867,6 +2875,11 @@ async def skip_command(interaction: discord.Interaction):
         logger.info(f"Resetting auto-extensions counter for {current_user.name} due to turn skip")
         draft_state["auto_extensions"][current_user] = 0
 
+    # Reset notification flags for the skipped user
+    draft_state['notification_flags'][current_user] = {
+        'halfway_notified': False,
+        'one_sixth_notified': False
+    }
     # Log the skip
     logger.info(f"Draft Staff {interaction.user.name} skipped {current_user.name}'s turn. Total skips: {draft_state['skipped_turns'][current_user]}")
 
