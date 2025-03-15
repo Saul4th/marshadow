@@ -3,10 +3,10 @@ import os
 from datetime import datetime
 import logging
 from typing import Optional, Dict, Any
-from dataclasses import dataclass, asdict
+#from dataclasses import dataclass
 import discord
-from datetime import datetime, UTC, timezone
-
+from datetime import datetime, timezone
+'''
 @dataclass
 class DraftState:
     participants: list
@@ -21,7 +21,9 @@ class DraftState:
     remaining_times: dict
     draft_phase: str
     timestamp: str
-
+    draft_channel_id: Optional[int] = None  # This should also be here
+    main_message: Optional[dict] = None     # Add this field
+'''
 class StateManager:
     def __init__(self, save_directory: str = "draft_states", max_saves: int = 10):
         self.save_directory = save_directory
@@ -58,8 +60,7 @@ class StateManager:
             self.logger.error(f"Error deserializing member: {e}")
             return None
 
-    def save_state(self, draft_state: dict, remaining_times: dict, 
-                filename: Optional[str] = None) -> str:
+    def save_state(self, draft_state: dict, remaining_times: dict, filename: Optional[str] = None) -> str:
         """Save the current draft state to a file"""
         try:
             self.logger.info(f"Attempting to save state with remaining_times: {remaining_times}")
@@ -87,13 +88,36 @@ class StateManager:
                     str(member.id): count 
                     for member, count in draft_state['auto_extensions'].items()
                 },
+                # Add the new turn_original_durations field
+                'turn_original_durations': {
+                    str(member.id): duration
+                    for member, duration in draft_state['turn_original_durations'].items()
+                },
                 'remaining_times': {
                     str(member.id): time 
                     for member, time in remaining_times.items()
                 },
-                'draft_phase': draft_state['draft_phase'],  # Add this line
+                'notification_flags': {
+                str(member.id): flags
+                for member, flags in draft_state.get('notification_flags', {}).items()
+                },
+                'draft_phase': draft_state['draft_phase'],
                 'timestamp': datetime.now().isoformat()
             }
+            
+            # Handle main_message reference for serialization
+            if 'main_message' in draft_state and draft_state['main_message'] is not None:
+                try:
+                    serializable_state['main_message_data'] = {
+                        'channel_id': draft_state['main_message'].channel.id,
+                        'message_id': draft_state['main_message'].id
+                    }
+                    self.logger.info(f"Saved main_message reference: channel {draft_state['main_message'].channel.id}, message {draft_state['main_message'].id}")
+                except Exception as e:
+                    self.logger.error(f"Failed to serialize main_message: {e}")
+                    serializable_state['main_message_data'] = None
+            else:
+                serializable_state['main_message_data'] = None
 
             # Generate filename if not provided
             if filename is None:
@@ -194,9 +218,21 @@ class StateManager:
                     for member_id, count in saved_state['auto_extensions'].items()
                     if (member := safe_deserialize({'id': int(member_id)})) is not None
                 },
+                # Add the new turn_original_durations field
+                'turn_original_durations': {
+                    member: duration 
+                    for member_id, duration in saved_state.get('turn_original_durations', {}).items()
+                    if (member := safe_deserialize({'id': int(member_id)})) is not None
+                },
+                'notification_flags': {
+                    member: flags
+                    for member_id, flags in saved_state.get('notification_flags', {}).items()
+                    if (member := safe_deserialize({'id': int(member_id)})) is not None
+                },
                 'draft_channel_id': saved_state.get('draft_channel_id'),
                 'draft_phase': saved_state.get('draft_phase', 'setup')
             }
+        
 
             remaining_times = {
                 member: time 
