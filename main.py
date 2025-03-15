@@ -1,10 +1,11 @@
 '''
 
-v0.61 - handles the token expiration limit of 15 min for API interaction, redos the timer to avoid time drift
-    0.61.1 - fix the "new timer as reply" for every message (need to code the reference and modify save and load states for handling of restoration) -OK
+    0.62 work on improving the /my_draft embed format 
+    0.63 figure out how to include the team logo in the final collage
+    0.64 Traducir a español
+    0.65 Documentar requerimientos
 
-    0.61.2 Alledgedly OK- Handling the unproper function when loading a previous state that causes DM notification to not show since remaining_time is now the restored time and /2 & /6 conditions shorten
-    After that is corrected, work on improving the /my_draft embed format and figure out how to include the team logo in the final collage
+    Después de eso, versión pre-alpha (base antes de incluir tera caps) debería estar lista 
 '''
 '''LIBRARIES'''
 import discord                          #Core Discord.py functionality 
@@ -928,6 +929,7 @@ class SaveStatePromptView(discord.ui.View):
         self.original_channel_id = original_channel_id
         self.message = None
         self.staff_member = staff_member  # Store which staff member this was sent to
+        self.decision_made = False  # Add this flag
     
     @discord.ui.button(label="Load Save State", style=discord.ButtonStyle.primary, custom_id="load_state")
     async def load_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1109,6 +1111,11 @@ class SaveStatePromptView(discord.ui.View):
                 await interaction.followup.send(error_msg, ephemeral=True)
     @discord.ui.button(label="Ignore Save", style=discord.ButtonStyle.secondary, custom_id="ignore_state")
     async def ignore_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        global staff_notification_attempts, pending_draft_state
+        
+        # Add this flag to track that an active decision was made
+        self.decision_made = True
+        
         if isinstance(interaction.channel, discord.DMChannel):
             await interaction.response.send_message("✅ Ignoring saved draft state. Starting fresh session.")
         else:
@@ -1139,11 +1146,44 @@ class SaveStatePromptView(discord.ui.View):
         # Clear the pending state
         pending_draft_state = None
         
+        # Clear staff notification tracking for this file
+        if self.filename in staff_notification_attempts:
+            del staff_notification_attempts[self.filename]
+            logger.info(f"Cleared staff notification tracking for {self.filename} after ignore decision")
+
+        # Notify other staff members about the decision
+        if self.staff_member:
+            try:
+                staff_role = discord.utils.get(self.guild.roles, name="Draft Staff")
+                if staff_role:
+                    for member in self.guild.members:
+                        if staff_role in member.roles and member != self.staff_member:
+                            try:
+                                dm_channel = await member.create_dm()
+                                info_embed = discord.Embed(
+                                    title="Draft State Update",
+                                    description=f"{self.staff_member.mention} chose to ignore the saved draft state.",
+                                    color=discord.Color.blue()
+                                )
+                                await dm_channel.send(embed=info_embed)
+                                logger.info(f"Notified {member.name} about ignore decision")
+                            except:
+                                logger.warning(f"Could not send decision notification to {member.name}")
+            except Exception as e:
+                logger.error(f"Error notifying staff members about ignore decision: {e}")
+        
         logger.info(f"User {interaction.user.display_name} chose to ignore saved state {self.filename}")
+        
+        # Stop the view
+        self.stop()
     
     async def on_timeout(self):
         global staff_notification_attempts
         
+        # If a decision was already made, don't proceed with timeout handling
+        if self.decision_made:
+            return
+            
         # Disable the buttons when the view times out
         for child in self.children:
             child.disabled = True
