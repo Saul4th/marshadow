@@ -1,7 +1,8 @@
 '''
 
-    0.62 work on improving the /my_draft embed format 
-    0.63 figure out how to include the team logo in the final collage
+    0.62 work on improving the /my_draft embed format -OK
+    0.63 figure out how to include the team logo in the final collage -OK
+    0.63.1 Added new slash command to set logos and fixed minor bugs found in the final grid and other functions -OK
     0.64 Traducir a español
     0.65 Documentar requerimientos
 
@@ -34,10 +35,15 @@ import sys
 import time
 import random
 import json
+from pathlib import Path  # Add this at the top with your other imports
 
 print("Current Working Directory:", os.getcwd())   #Can be removed as needed
 
 '''GLOBAL VARIABLES'''
+# Modify the constant to use Path
+TEAM_LOGOS_DIR = Path("assets/team_logos")
+TEAM_LOGOS_DIR.mkdir(parents=True, exist_ok=True)  # Create directory if it doesn't exist
+
 # Set the maximum number of timer extensions allowed per participant
 extensions_limit = 3  # You can adjust this value
 
@@ -52,7 +58,7 @@ stall_group = ["blissey", "toxapex", "skarmory", "chansey","clefable","clodsire"
 
 # Set variable for number of Pokémon per Draft
 draft_size = 4
-total_points = 400
+total_points = 1200
 
 # Define the number of coaches allowed in the draft
 coaches_size = 2 # Default value
@@ -262,20 +268,39 @@ if not google_services.initialize():
     exit(1)  # Exit if we can't initialize Google services
 
 # Function to create a 6x2 grid collage with the user's avatar in position (1,1)
-def create_sprite_collage(pokemon_names, pokemon_data, avatar_url):
+def create_sprite_collage(pokemon_names, pokemon_data, avatar_url, user_id):
     images = []
     
-    # Download the user's avatar (handle cases where avatar_url is None)
-    if avatar_url:
-        response = requests.get(avatar_url)
-        if response.status_code == 200:
-            avatar_img = Image.open(BytesIO(response.content))
-            avatar_img = avatar_img.resize((96, 96))  # Resize avatar to match sprite size
-            images.append(avatar_img)  # Add avatar as the first image
+    # Try to get team logo first
+    logo_path = TEAM_LOGOS_DIR / f"{user_id}.png"
+    if logo_path.exists():
+        try:
+            logo_img = Image.open(logo_path)
+            logo_img = logo_img.resize((96, 96))  # Resize logo to match sprite size
+            images.append(logo_img)  # Add logo as the first image
+        except Exception as e:
+            logger.error(f"Failed to load team logo for user {user_id}: {e}")
+            # Fallback to avatar
+            if avatar_url:
+                response = requests.get(avatar_url)
+                if response.status_code == 200:
+                    avatar_img = Image.open(BytesIO(response.content))
+                    avatar_img = avatar_img.resize((96, 96))
+                    images.append(avatar_img)
+            else:
+                default_avatar = Image.new("RGBA", (96, 96), (255, 255, 255, 0))  # Transparent image
+                images.append(default_avatar)
     else:
-        # Use a default image if no avatar is available
-        default_avatar = Image.new("RGBA", (96, 96), (255, 255, 255, 0))  # Transparent image
-        images.append(default_avatar)
+        # No logo exists, use avatar
+        if avatar_url:
+            response = requests.get(avatar_url)
+            if response.status_code == 200:
+                avatar_img = Image.open(BytesIO(response.content))
+                avatar_img = avatar_img.resize((96, 96))
+                images.append(avatar_img)
+        else:
+            default_avatar = Image.new("RGBA", (96, 96), (255, 255, 255, 0))  # Transparent image
+            images.append(default_avatar)
     
     # Download Pokémon sprites
     for pokemon_name in pokemon_names:
@@ -286,20 +311,48 @@ def create_sprite_collage(pokemon_names, pokemon_data, avatar_url):
             img = Image.open(BytesIO(response.content))
             images.append(img)
     
-    # Create a blank canvas for the collage (6 columns x 2 rows)
+   # Create a blank canvas for the collage
     sprite_width = 96  # Width of each sprite
     sprite_height = 96  # Height of each sprite
-    collage_width = sprite_width * 6
+    # Calculate collage width based on whether draft_size is odd or even
+    if draft_size % 2 == 0:
+        collage_width = sprite_width * ((draft_size//2)+1)
+    else:
+        collage_width = sprite_width * (-(-draft_size//2)) 
     collage_height = sprite_height * 2
     collage = Image.new("RGBA", (collage_width, collage_height))
-    
+
+    # Calculate how many Pokémon per row
+    first_row_pokemon = draft_size // 2  # This is the key change
+    second_row_pokemon = (draft_size + 1) // 2  # For odd numbers, second row gets one more
+
     # Paste images into the grid
     for i, img in enumerate(images):
-        if i >= 12:  # Limit to 12 images (6x2 grid)
+        if i >= draft_size + 1:  # Limit to draft_size + 1 (for logo) images
             break
-        x = (i % 6) * sprite_width
-        y = (i // 6) * sprite_height
+            
+        if i == 0:  # Logo always goes in top-left
+            x = 0
+            y = 0
+        else:
+            # For Pokémon images
+            pokemon_index = i - 1  # Adjust index to account for logo
+            
+            if pokemon_index < first_row_pokemon:
+                # First row
+                x = (pokemon_index + 1) * sprite_width  # Start after logo
+                y = 0
+            else:
+                # Second row
+                second_row_index = pokemon_index - first_row_pokemon
+                if draft_size % 2 == 0:  # Even number of Pokémon
+                    x = (second_row_index + 1) * sprite_width  # Start indented
+                else:  # Odd number of Pokémon
+                    x = second_row_index * sprite_width  # Start from first column
+                y = sprite_height
+
         collage.paste(img, (x, y))
+
     
     # Save the collage to a file
     collage.save("collage.png")
@@ -933,6 +986,7 @@ class SaveStatePromptView(discord.ui.View):
     
     @discord.ui.button(label="Load Save State", style=discord.ButtonStyle.primary, custom_id="load_state")
     async def load_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.decision_made = True  # Mark that a decision was made
         # First check if we're in a DM channel - if so, we need a different approach
         if isinstance(interaction.channel, discord.DMChannel):
             # This is a DM, so we need to get the original channel
@@ -1391,10 +1445,10 @@ async def show_final_teams(interaction: discord.Interaction):
         # Show final teams
         for member, team in draft_state["teams"].items():
             # Get the user's avatar URL
-            avatar_url = str(member.avatar.url)  # Get the URL of the user's avatar
+            avatar_url = str(member.avatar.url) if member.avatar else None # Get the URL of the user's avatar
             
-            # Create a sprite collage with the user's avatar
-            collage_path = create_sprite_collage(team["pokemon"], pokemon_data, avatar_url)
+            # Create a sprite collage with team logo or fallback to avatar
+            collage_path = create_sprite_collage(team["pokemon"], pokemon_data, avatar_url, member.id)
             
             file = discord.File(collage_path, filename="collage.png")
             embed = discord.Embed(title=f"{member.display_name}'s Team", color=discord.Color.blue())
@@ -1463,7 +1517,9 @@ async def validate_pokemon_name(interaction: discord.Interaction, pokemon_name: 
             "\n".join(similar_names) if similar_names else "Sorry, no similar names found."
         )
         await interaction.response.send_message(message, ephemeral=True)
-        await extend_timer(interaction, user, 60)
+        # Only extend if less than 5 minutes remaining
+        if user in remaining_times and remaining_times[user] < 300:
+            await extend_timer(interaction, user, 60)
         return False, None
     
     return True, pokemon_data[pokemon_name]
@@ -1478,7 +1534,9 @@ async def validate_pokemon_rules(interaction: discord.Interaction, pokemon_name:
             f"You cannot pick another Pokémon from this group.",
             ephemeral=True
         )
-        await extend_timer(interaction, user, 60)
+        # Only extend if less than 5 minutes remaining
+        if user in remaining_times and remaining_times[user] < 300:
+            await extend_timer(interaction, user, 60)
         return False
 
     # Check Species Clause
@@ -1488,7 +1546,9 @@ async def validate_pokemon_rules(interaction: discord.Interaction, pokemon_name:
             f"You cannot pick {pokemon_name.capitalize()} due to the Species Clause.",
             ephemeral=True
         )
-        await extend_timer(interaction, user, 60)
+        # Only extend if less than 5 minutes remaining
+        if user in remaining_times and remaining_times[user] < 300:
+            await extend_timer(interaction, user, 60)
         return False
     
     return True
@@ -1514,7 +1574,8 @@ async def validate_points(interaction: discord.Interaction, pokemon_name: str, p
             + "\n".join([f"• {point} points" for point in valid_points])
         )
         await interaction.response.send_message(message, ephemeral=True)
-        await extend_timer(interaction, user, 60)
+        if user in remaining_times and remaining_times[user] < 300:
+            await extend_timer(interaction, user, 60)
         return False
     
     return True
@@ -1647,13 +1708,13 @@ async def start_timer(interaction, participant, adjusted_duration=None, referenc
         if skipped_turns == 1:
             original_duration = TIMER_DURATION // 2  # Half the initial time
             await channel.send(
-                f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(adjusted_duration)}**.",
+                f"⚠️ {participant.mention}, you were skipped once before. Your timer is now **{format_time(original_duration)}**.",
                 reference=reference_message  # Add reference to create a reply
             )
         elif skipped_turns >= 2:
             original_duration = TIMER_DURATION // 4  # Quarter of the initial time
             await channel.send(
-                f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(adjusted_duration)}**.",
+                f"⚠️ {participant.mention}, you were skipped multiple times before. Your timer is now **{format_time(original_duration)}**.",
                 reference=reference_message  # Add reference to create a reply
             )
         else:
@@ -1843,7 +1904,7 @@ async def extend_timer(interaction: discord.Interaction, participant, extend_tim
 
     await interaction.followup.send(
         f"⏰ {participant.mention}, you were granted **{extend_time} extra seconds** to make a valid pick. "
-        f"You have **{format_time(new_duration)}** remaining."
+        f"You have **{format_time(new_duration)}** remaining.", ephemeral=True
     )
     logger.info(f"{participant.name} has **{extensions_limit - draft_state['extensions'][participant]} extensions** remaining")
 
@@ -1851,8 +1912,6 @@ async def extend_timer(interaction: discord.Interaction, participant, extend_tim
     timer_task = asyncio.create_task(start_timer(interaction, participant, new_duration))
     participant_timers[participant] = timer_task
     
-# Modified notify_current_participant to track reference messages
-# Modified notify_current_participant to handle webhook limitations
 # Modified notify_current_participant to handle message threading properly
 async def notify_current_participant(interaction, reference_message=None):
     global draft_state, participant_timers
@@ -2989,8 +3048,8 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
         logger.info(f"{user.name} timer cancelled with {current_remaining_time} seconds remaining")
 
     # Send public message if remaining time is less than a minute
-    if current_remaining_time and current_remaining_time < 60:
-        logger.info(f"{user.name} confirming pick with less than 60 seconds remaining")
+    if current_remaining_time:
+        logger.info(f"{user.name} confirming pick ")
         await interaction.channel.send(f"{user.display_name} is confirming their Pokémon pick, timer will resume in 30 seconds")
 
     # --- 5. Create confirmation message ---
@@ -3042,22 +3101,24 @@ async def pick_pokemon(interaction: discord.Interaction, pokemon_name: str):
             )
         else:
             extension_msg = (
-                "No automatic extension granted. " +
-                ("You've used all 3 automatic extensions this turn." if draft_state["auto_extensions"][user] >= 3 else "")
+                ("\nNo automatic extension granted. " +
+                "You've used all 3 automatic extensions this turn." if draft_state["auto_extensions"][user] >= 3 else "")
             )
 
-        # Resume timer with appropriate time
-        timer_task = asyncio.create_task(start_timer(interaction, user, resume_time))
-        participant_timers[user] = timer_task
-        
         action = "timed out" if view.value is None else "cancelled"
         logger.info(f"{user.name} {action} pick of {pokemon_name}")
         await interaction.followup.send(
             f"Pick confirmation {action}. Please try again.\n{extension_msg}" if view.value is None 
-            else f"Pick cancelled. You can try picking another Pokémon.\n{extension_msg}", 
-            ephemeral=True
+            else f"Pick cancelled.{extension_msg}"
         )
+    
+        # Resume timer with appropriate time
+        timer_task = asyncio.create_task(start_timer(interaction, user, resume_time))
+        participant_timers[user] = timer_task
+
         return
+        
+       
 
     # --- 6. Process confirmed pick ---
     points_left = process_pick(user, pokemon_name, pokemon_info)
@@ -3271,22 +3332,109 @@ async def my_draft_command(interaction: discord.Interaction):
         return
 
     team = draft_state["teams"][user]
-    pokemon_list = ", ".join(team["pokemon"]) if team["pokemon"] else "None"
     points_left = team["points"]
+    picks_left = draft_size - len(team["pokemon"])
+    skips = draft_state["skipped_turns"].get(user, 0)
+    
+    # Calculate points used
+    points_used = total_points - points_left
+    points_percentage = (points_used / total_points) * 100
 
+    # Create the main embed
     embed = discord.Embed(
-        title=f"{user.display_name}'s Draft",
-        description=f"**Pokémon:** {pokemon_list}\n**Points Left:** {points_left}",
+        title=f"🎮 {user.display_name}'s Draft Status",
         color=discord.Color.blue()
     )
 
+    # Try to get team logo first, fallback to avatar
+    logo_path = TEAM_LOGOS_DIR / f"{user.id}.png"
+    has_logo = False
+    if logo_path.exists():
+        file = discord.File(str(logo_path), filename="team_logo.png")
+        embed.set_thumbnail(url="attachment://team_logo.png")
+        has_logo = True
+    elif user.avatar:
+        embed.set_thumbnail(url=user.avatar.url)
+
+    # Add draft progress section
+    embed.add_field(
+        name="📊 Draft Progress",
+        value=f"• Pokémon Picked: **{len(team['pokemon'])}/{draft_size}**\n"
+              f"• Picks Remaining: **{picks_left}**\n"
+              f"• Times Skipped: **{skips}**",
+        inline=False
+    )
+
+    # Add points section
+    embed.add_field(
+        name="💰 Points Status",
+        value=f"• Points Remaining: **{points_left}**\n"
+              f"• Points Used: **{points_used}** ({points_percentage:.1f}%)\n"
+              f"• Total Points: **{total_points}**",
+        inline=False
+    )
+
+    # If they have Pokémon, add team section with details
+    if team["pokemon"]:
+        team_details = []
+        for pokemon in team["pokemon"]:
+            pokemon_info = pokemon_data[pokemon]
+            team_details.append(
+                f"• {pokemon.capitalize()} "
+                f"({pokemon_info['points']} Points)"
+            )
+        
+        embed.add_field(
+            name="🎯 Your Team",
+            value="\n".join(team_details),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🎯 Your Team",
+            value="No Pokémon picked yet",
+            inline=False
+        )
+
+    # Add some tips based on their situation
+    tips = []
+    if picks_left > 0:
+        if points_left < 40:  # Assuming 40 is your lowest tier
+            tips.append("⚠️ Low on points! Consider picking lower-tier Pokémon.")
+        elif points_left > (picks_left * 100):  # If they have lots of points left
+            tips.append("💡 You have plenty of points! Consider some higher-tier picks.")
+        
+        # Check if they're close to stall group limit
+        stall_count = sum(1 for p in team["pokemon"] if p in stall_group)
+        if stall_count == 1:
+            tips.append("⚠️ You have 1 stall group Pokémon. You can pick 1 more.")
+        elif stall_count == 2:
+            tips.append("⚠️ You've reached your stall group limit!")
+
+    if tips:
+        embed.add_field(
+            name="💭 Tips",
+            value="\n".join(tips),
+            inline=False
+        )
+
+    # Add footer with current time
+    current_time = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    embed.set_footer(text=f"Last Updated: {current_time}")
+
     try:
-        await user.send(embed=embed)
+        if has_logo:
+            await user.send(embed=embed, file=file)
+        else:
+            await user.send(embed=embed)
         logger.info(f"User {user.name} draft details sent via DM")
         await interaction.response.send_message("Check your DMs for your draft details!", ephemeral=True)
     except discord.Forbidden:
         logger.info(f"User {user.name} draft details sent in channel (DMs forbidden)")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if has_logo:
+            await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 #Slash Command to swap pokémon
 @bot.tree.command(
@@ -3565,6 +3713,167 @@ async def load_state(interaction: discord.Interaction):
             f"❌ Error listing saved states: {str(e)}",
             ephemeral=True
         )
+
+#Slash command to set the logos
+@bot.tree.command(name="set_team_logo", description="Set a coach's team logo", guild=GUILD_ID)
+@app_commands.describe(
+    coach="The coach to set the logo for",
+    logo="The team logo image (PNG format recommended)"
+)
+@has_draft_staff_role()
+async def set_team_logo(
+    interaction: discord.Interaction,
+    coach: str,
+    logo: discord.Attachment
+):
+    # Check if draft is in setup phase
+    if draft_state["draft_phase"] != "setup":
+        await interaction.response.send_message(
+            "Team logos can only be set during draft setup.",
+            ephemeral=True
+        )
+        return
+
+    # Validate the attachment is an image
+    if not logo.content_type.startswith('image/'):
+        await interaction.response.send_message(
+            "Please upload an image file.",
+            ephemeral=True
+        )
+        return
+        
+    # Get the target member
+    try:
+        coach_id = int(coach)
+        target_member = interaction.guild.get_member(coach_id)
+        if not target_member:
+            await interaction.response.send_message(
+                "Could not find the selected coach.",
+                ephemeral=True
+            )
+            return
+            
+        # Verify the member has the Draft role
+        draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
+        if not draft_role or draft_role not in target_member.roles:
+            await interaction.response.send_message(
+                f"{target_member.display_name} does not have the Draft role.",
+                ephemeral=True
+            )
+            return
+            
+        logo_path = TEAM_LOGOS_DIR / f"{coach_id}.png"
+        
+        # Check if logo already exists
+        if os.path.exists(logo_path):
+            # Create confirmation view
+            class ConfirmReplace(discord.ui.View):
+                def __init__(self):
+                    super().__init__(timeout=30)
+                    self.value = None
+
+                @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
+                async def confirm(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                    self.value = True
+                    self.stop()
+
+                @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+                async def cancel(self, button_interaction: discord.Interaction, button: discord.ui.Button):
+                    self.value = False
+                    self.stop()
+
+            view = ConfirmReplace()
+            await interaction.response.send_message(
+                f"A logo already exists for {target_member.display_name}. Do you want to replace it?",
+                view=view,
+                ephemeral=True
+            )
+
+            # Wait for response
+            await view.wait()
+            if view.value is None:
+                await interaction.followup.send(
+                    "Response timed out. The coach is keeping their previous logo.",
+                    ephemeral=True
+                )
+                return
+            elif not view.value:
+                await interaction.followup.send(
+                    f"{target_member.display_name} is keeping their previous logo.",
+                    ephemeral=True
+                )
+                return
+                
+            # If we get here, delete the old logo
+            try:
+                os.remove(logo_path)
+            except Exception as e:
+                logger.error(f"Error deleting old logo: {e}")
+                await interaction.followup.send(
+                    "Error replacing the logo. Please try again.",
+                    ephemeral=True
+                )
+                return
+        else:
+            await interaction.response.defer(ephemeral=True)
+
+        # Then in the save part:
+        try:
+            # Save new logo
+            await logo.save(str(logo_path))  # Convert Path to string for discord.py
+            
+            # Verify and optimize image
+            with Image.open(logo_path) as img:
+                # Convert to PNG and optimize
+                img = img.convert('RGBA')
+                img.save(str(logo_path), 'PNG', optimize=True)
+            
+            success_message = f"Team logo has been {'updated' if logo_path.exists() else 'set'} for {target_member.display_name}!"
+            
+            # Try to delete the upload message
+            try:
+                if interaction.message:
+                    await interaction.message.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete logo upload message: {e}")
+
+            await interaction.followup.send(success_message, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error handling logo for {target_member.display_name} (ID: {coach_id}): {e}")
+            # Check if the file was actually saved despite the error
+            if logo_path.exists():
+                await interaction.followup.send(
+                    "The logo was saved successfully, but there was a minor error in the process. The logo will work correctly.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "There was an error saving the team logo.",
+                    ephemeral=True
+                )
+            
+    except Exception as e:
+        logger.error(f"Error in set_team_logo: {e}")
+        await interaction.followup.send(
+            "An error occurred. Please try again.",
+            ephemeral=True
+        )
+
+# Add autocomplete for coach selection
+@set_team_logo.autocomplete('coach')
+async def set_logo_coach_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete for coach selection in set_team_logo command"""
+    draft_role = discord.utils.get(interaction.guild.roles, name="Draft")
+    if not draft_role:
+        return []
+        
+    choices = [
+        app_commands.Choice(name=member.display_name, value=str(member.id))
+        for member in interaction.guild.members
+        if draft_role in member.roles and current.lower() in member.display_name.lower()
+    ]
+    return choices[:25]  # Discord limits to 25 choices
 
 # Autocomplete functions tied to /swap_pokemon
 @swap_pokemon_command.autocomplete('coach')
